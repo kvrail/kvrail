@@ -233,6 +233,14 @@ QP: it matches an ACK to its request and does not identify an operation.
   (`PagedSSDCacheManager`) and keeps its RAM tier, its index and its block hashes. oMLX has no
   interface for a cache backend, so the connector is a patch that follows the oMLX releases until
   such an interface exists upstream.
+- Remote lookup: the block hashes are chained over the token IDs, so the connector computes the
+  hash of every block of a prompt without the store. When the local index has no entry for a
+  block, the connector sends `Lookup` with the namespace and the block hashes of the prompt, in
+  order, before it prefills. The store answers with the longest run of leading blocks that it
+  holds, because a restore needs the complete chain from the first block. A hit adds the blocks to
+  the local index. This is how a Studio finds the blocks that another Studio wrote. After a
+  restart of the runtime the connector does not copy the index from the store; the index fills
+  again through these lookups.
 - `vllm-mlx`: the connector replaces `SSDCacheTier`. This path covers models whose cache consists
   of `KVCache`, `CacheList` and `ArraysCache` layers.
 - Full Prefix Restore (every session that fits Studio memory): pipelined layer-wise prefetch over
