@@ -32,6 +32,12 @@ Non-goals:
   links between co-located Macs.
 - Multimodal inputs (images, video, audio). The block key covers token IDs only, so the connector
   bypasses the store for every request that contains them.
+- Adapters and runtime options that change the cache. The block key covers the base checkpoint and
+  the token IDs only. The connector therefore bypasses the store, for reads and for writes, when
+  the loaded model has an adapter (request field `adapters` or server flag `--adapter-path`), a
+  draft model, KV quantization (`--kv-bits`), a bounded cache (`--max-kv-size`) or SpecPrefill.
+  M1 defines how the store handles the MTP cache that a runtime appends, because both reference
+  checkpoints use MTP.
 
 ## 2. Target use cases
 
@@ -150,7 +156,19 @@ the data intact, and a send waits until the peer posts a matching receive (TN320
 every transfer has a deadline: 5 ms for a `QP0` RPC, 50 ms for one `QP1` frame, and for a `QP1`
 batch the time that its size needs at 1.9 GB/s (half of the one-cable target), with a minimum of
 50 ms. On timeout or `xxHash64` mismatch, the client drops the partial transfer and retries it
-once on the other rail when two cables connect the peers. When no rail is left:
+once on the other rail when two cables connect the peers.
+
+A timeout takes the rail out of service. The side that detects the timeout resets its QPs of that
+rail before it retries; in verbs semantics the reset discards its queued sends and its posted
+receives. Until its own reset returns, a side keeps every buffer that a work request on that rail
+references registered, does not change a source buffer, and does not trust a destination buffer.
+This rule applies to the Studio and to `kvraild`. The rail returns to service only through the
+setup exchange, and the peer resets its QPs of that rail before it answers the exchange. A
+receiver commits a block only after all its chunks pass the checksum. TN3205 does not specify the
+reset behavior; M0 verifies on macOS that a reset QP delivers no queued send and fills no posted
+receive.
+
+When no rail is left:
 
 - Full Prefix Restore falls back to local prefill on the Studio.
 - Out-of-Core Retrieval fails the request with an explicit error. The Studio cannot hold
@@ -167,9 +185,11 @@ QP: it matches an ACK to its request and does not identify an operation.
 - Block unit: 256 tokens, addressed by chained content hash
   `H_i = BLAKE3(model_uuid || quant_fmt || H_{i-1} || token_ids[256*i : 256*(i+1)])` with a
   256-bit digest. BLAKE3 is collision resistant, so crafted prompt text cannot alias another
-  block; `xxHash64` stays as the frame checksum. `quant_fmt` is the quantization of the model
-  weights. The encoding of a stored block (FP16/BF16, FP8, Affine4) is block metadata and not part
-  of the key, so recompression keeps the address.
+  block; `xxHash64` stays as the frame checksum. `model_uuid` is a digest of the (file name, file
+  hash) pairs, sorted by name, of the weight files and `config.json` of the loaded checkpoint, so
+  it identifies the exact weights; the connector computes it for each model that it loads.
+  `quant_fmt` is the quantization of the model weights. The encoding of a stored block (FP16/BF16,
+  FP8, Affine4) is block metadata and not part of the key, so recompression keeps the address.
 - Block content: the cache rows that grow with the tokens of the block (KV, compressed KV, index
   keys). Head record: the state of fixed size at one position (sliding windows, recurrent states;
   section 3.1). A head record is too large to store for every block, so the store keeps it only at
