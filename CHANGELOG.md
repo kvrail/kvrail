@@ -11,6 +11,11 @@ All notable changes to this project are documented in this file. The format foll
   taken from PyPI and crates.io, and notes from this file.
 - README badges for PyPI, crates.io, CI and the license.
 
+### Changed
+
+- The TigerStyle guide now lives in [kvrail/tigerstyle](https://github.com/kvrail/tigerstyle);
+  `docs/style-profile.md` links to its pinned revision r5.
+
 ## [0.0.1] - 2026-11-17
 
 ### Added

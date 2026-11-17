@@ -1,9 +1,11 @@
 # KVRail style profile
 
-KVRail follows TigerStyle as restated in "Adapting TigerStyle to Your Codebase" (revision 5,
-2026-11-17). This file is the project profile that the guide asks for: which blocks apply, which
-mechanisms we chose, every limit and its reaction, and the exceptions. Where this file is silent,
-the guide holds.
+KVRail follows TigerStyle as restated in "Adapting TigerStyle to Your Codebase", revision r5:
+[kvrail/tigerstyle@r5](https://github.com/kvrail/tigerstyle/blob/r5/TIGER_STYLE.md). The link is
+pinned to the tag, so a later revision of the guide changes nothing here until this file moves to
+it. This file is the project profile that the guide asks for: which blocks apply, which mechanisms
+we chose, every limit and its reaction, and the exceptions. Where this file is silent, the guide
+holds.
 
 ## Scope (v0.0.1)
 
