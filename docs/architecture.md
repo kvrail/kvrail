@@ -26,13 +26,14 @@ Goals:
 
 Non-goals:
 
-- Writing another HTTP chat server or tool-call parser. KVRail plugs into `vllm-mlx` (replacing its
-  local `SSDCacheTier`) and `mlx-lm` while keeping standard OpenAI and Anthropic endpoints intact.
+- Writing another HTTP chat server or tool-call parser. KVRail plugs into oMLX (in place of the SSD
+  tier of its block cache) and `vllm-mlx` (in place of its local `SSDCacheTier`) while keeping
+  standard OpenAI and Anthropic endpoints intact.
 - Cross-Internet or untrusted-WAN transport. KVRail runs on physically point-to-point Thunderbolt 5
   links between co-located Macs.
-- Multimodal inputs (images, video, audio). The block key covers token IDs only, so the connector
-  bypasses the store for every request that contains them.
-- Adapters and runtime options that change the cache. The block key covers the base checkpoint and
+- Multimodal inputs (images, video, audio). KVRail does not verify how a runtime keys them, so the
+  connector bypasses the store for every request that contains them.
+- Adapters and runtime options that change the cache. The block address covers the checkpoint and
   the token IDs only. The connector therefore bypasses the store, for reads and for writes, when
   the loaded model has an adapter (request field `adapters` or server flag `--adapter-path`), a
   draft model, KV quantization (`--kv-bits`), a bounded cache (`--max-kv-size`) or SpecPrefill.
@@ -53,9 +54,10 @@ Non-goals:
 3. Research: context beyond Studio memory. A 1M-token session of the Qwen4 architecture takes
    25.9 GiB of cache, and three such sessions fill the Studio headroom. The Studio keeps the index
    keys and fetches from the Mac mini only the rows that the indexer of the model selects (M3).
-4. Immortal warm cache across restarts: restarting `vllm-mlx`, changing flags, or rebooting the
-   Studio leaves 100% of warm KV blocks intact in the Mac mini's 48 GiB L1.5 RAM and 7.0 TiB L2
-   slab.
+4. Immortal warm cache across restarts: restarting the runtime, changing flags, or rebooting the
+   Studio leaves intact every block that the store holds in the Mac mini's 48 GiB L1.5 RAM and
+   7.0 TiB L2 slab. A block that was used once can leave L1.5 without a copy in L2 (admission
+   filter, section 4.2); the Studio prefills such a block again.
 5. Zero wear on soldered Studio NAND: all agent cache writes hit replaceable M.2 TLC drives in the
    external TB5 enclosure, filtered by a reuse admission policy.
 
@@ -85,17 +87,20 @@ Non-goals:
 
 ### 3.1 Reference models and cache sizing
 
-KVRail sizes its targets against two models. The values come from the model configuration and
-the `mlx-lm` source with 16-bit cache values; they are estimates until M0 measures them.
+KVRail sizes its targets against two models. The values are estimates until M0 measures them. The
+values for DeepSeek-V4.1-Flash-1017 come from the memory estimator of oMLX, which packs the cache
+to FP4 and FP8. The values for Qwen3.8-Flash-Next come from the `mlx-lm` source with 16-bit cache
+values.
 
 | Model                    | Growth per token | Head record | 120k session | Switch, 1 / 2 cables |
 |--------------------------|------------------|-------------|--------------|----------------------|
-| DeepSeek-V4.1-Flash-1017 | 3,200 B          | 5.0 MiB     | 0.36 GiB     | 0.10 s / 0.06 s      |
+| DeepSeek-V4.1-Flash-1017 | 890 B            | 2.6 MiB     | 0.10 GiB     | 0.03 s / 0.02 s      |
 | Qwen3.8-Flash-Next       | 27,648 B         | 108 MiB     | 3.20 GiB     | 0.90 s / 0.50 s      |
 
 - DeepSeek-V4.1-Flash-1017 (MLX checkpoint 402 GiB, the model of use case 1): each of 40 layers
   keeps a sliding window of 128 tokens; four source layers add compressed KV and index keys, 2.5
-  entries per token in total.
+  entries per token in total. A runtime that keeps 16-bit values, as `mlx-lm` does, needs 3,200 B
+  per token for the same cache.
 - Qwen3.8-Flash-Next (preview of the Qwen4 architecture): 12 of 48 layers keep K, V and an indexer
   key for every token; 36 Gated DeltaNet layers keep a state of fixed size.
 - Growth per token is the cache that grows with the context. The head record is the state of fixed
@@ -105,7 +110,7 @@ the `mlx-lm` source with 16-bit cache values; they are estimates until M0 measur
 
 Consequences:
 
-- With DeepSeek-V4.1-Flash-1017, the 80 GiB headroom of the Studio holds about 220 sessions of
+- With DeepSeek-V4.1-Flash-1017, the 80 GiB headroom of the Studio holds about 780 sessions of
   120k tokens. For this model the store gives restart survival, snapshots and sharing between
   Studios. Its switch time does not need two rails, and its cache does not need the full slab.
 - A model of the Qwen4 architecture that leaves the same headroom holds 25 such sessions, or three
@@ -114,9 +119,12 @@ Consequences:
 - The hardware targets (two rails, 8 TB RAID) therefore depend on the model. M0 measures the cache
   size and the cold prefill time on the reference hardware, and confirms or reduces these targets
   (section 6).
-- At the time of writing, `mlx-lm` rejects the DeepSeek-V4.1-Flash-1017 checkpoint because it does
-  not implement the Engram layers; the MLX checkpoints target oMLX. M1 must name the runtime of
-  the connector for this model.
+- The connector runtime for DeepSeek-V4.1-Flash-1017 is oMLX. `mlx-lm` rejects the Engram layers
+  of the checkpoint, and `vllm-mlx` cannot serialize the cache classes of this model. oMLX already
+  has a block cache with a RAM tier and an SSD tier. KVRail takes the place of the SSD tier and
+  adds sharing between Studios (section 4.3).
+- The connector runtime for Qwen3.8-Flash-Next is open: `mlx-lm` has this model on its main branch
+  only.
 
 ## 4. Architecture
 
@@ -182,33 +190,51 @@ QP: it matches an ACK to its request and does not identify an operation.
 
 ### 4.2 Storage and indexing daemon (`kvraild` on Mac mini)
 
-- Block unit: 256 tokens, addressed by chained content hash
-  `H_i = BLAKE3(model_uuid || quant_fmt || H_{i-1} || token_ids[256*i : 256*(i+1)])` with a
-  256-bit digest. BLAKE3 is collision resistant, so crafted prompt text cannot alias another
-  block; `xxHash64` stays as the frame checksum. `model_uuid` is a digest of the (file name, file
-  hash) pairs, sorted by name, of the weight files and `config.json` of the loaded checkpoint, so
-  it identifies the exact weights; the connector computes it for each model that it loads.
-  `quant_fmt` is the quantization of the model weights. The encoding of a stored block (FP16/BF16,
-  FP8, Affine4) is block metadata and not part of the key, so recompression keeps the address.
+- Block unit: a run of tokens whose length the runtime sets for each model, 256 tokens by default
+  and at most 8192. oMLX uses 2048 tokens or more for DeepSeek-V4.1.
+- Block address: 256 bits inside a namespace. The namespace is
+  `BLAKE3(model_uuid || quant_fmt || cache format of the runtime)`. `model_uuid` is a digest of
+  the (file name, file hash) pairs, sorted by name, of the weight files and `config.json` of the
+  loaded checkpoint, so it identifies the exact weights; the connector computes it for each model
+  that it loads. `quant_fmt` is the quantization of the model weights. When the runtime has its
+  own chained block hash, KVRail uses that hash as the address and computes no second hash: oMLX
+  chains SHA-256 over the parent hash, the token IDs and the image hashes. Otherwise the connector
+  computes `H_i = BLAKE3(H_{i-1} || token IDs of block i)`. Both hashes are collision resistant,
+  so crafted prompt text cannot alias another block; `xxHash64` stays as the frame checksum. The
+  encoding of a stored block (FP16/BF16, FP8, Affine4) is block metadata and not part of the
+  address, so recompression keeps the address.
 - Block content: the cache rows that grow with the tokens of the block (KV, compressed KV, index
   keys). Head record: the state of fixed size at one position (sliding windows, recurrent states;
-  section 3.1). A head record is too large to store for every block, so the store keeps it only at
-  snapshot heads and at turn boundaries. A restore resumes from the longest cached prefix that has
-  a head record, and the Studio prefills the tokens after it.
+  section 3.1). oMLX writes this state into every block and adds a tail block at the end of each
+  stored request; that is acceptable for blocks of 2048 tokens or more. With 256-token blocks the
+  head record is too large to store for every block, so the store keeps it only at snapshot heads
+  and at turn boundaries. A restore resumes from the longest cached prefix that has this state,
+  and the Studio prefills the tokens after it.
 - L1.5 Hot Pool (48 GiB unified memory): pinned ring of page-aligned buffers registered once with
-  `ibv_reg_mr` at startup. Serves hot prefixes and active snapshot heads in < 1 ms.
+  `ibv_reg_mr` at startup. Serves hot prefixes and active snapshot heads in < 1 ms. The RAM tier
+  of the runtime on the Studio stays the first tier; L1.5 serves blocks that the Studio evicted
+  and blocks that another Studio wrote.
 - L2 Raw Slab (7.0 TiB single preallocated file on RAID 0): replaces per-block `.safetensors`
   files and SQLite hot-path locks. Uses a bounded worker pool issuing `pread`/`pwrite` (`QD=16..24`)
   with `fcntl(fd, F_NOCACHE, 1)` so macOS buffer cache never evicts L1.5 pools or model weights.
 - SSD wear admission filter: blocks written once by transient one-off prompts stay in L1.5 RAM and
   evict without touching NAND; only blocks with `hit_count >= 2` or explicit `pin` flush to L2.
 - M5 Pro GPU background pipeline: quantizes cold FP16/BF16 KV blocks to FP8 / Affine4 (2-4x wire
-  and disk reduction).
+  and disk reduction). It stores blocks that the runtime already packs as they are: oMLX packs the
+  DeepSeek-V4.1 cache to FP4 and FP8. The pipeline publishes the recompressed data and its
+  encoding together as one new version of the block; a reader sees the old version or the new
+  version, never a mix.
 - CoW Radix index: reference-counted prefix nodes supporting `snapshot create`, `snapshot fork`,
   and `snapshot drop` in O(depth) metadata updates with append-only journal checkpoints.
 
-### 4.3 Compute connector (`vllm-mlx` / `mlx-lm` on Mac Studio)
+### 4.3 Compute connector (oMLX / `vllm-mlx` on Mac Studio)
 
+- oMLX: the connector replaces the file I/O of the SSD tier of the oMLX block cache
+  (`PagedSSDCacheManager`) and keeps its RAM tier, its index and its block hashes. oMLX has no
+  interface for a cache backend, so the connector is a patch that follows the oMLX releases until
+  such an interface exists upstream.
+- `vllm-mlx`: the connector replaces `SSDCacheTier`. This path covers models whose cache consists
+  of `KVCache`, `CacheList` and `ArraysCache` layers.
 - Full Prefix Restore (every session that fits Studio memory): pipelined layer-wise prefetch over
   `QP1` (layer `L+1` arrives into pre-registered `MTLBuffer` slots while Studio GPU computes layer
   `L`), plus the head record of the resume position.
@@ -234,7 +260,7 @@ module lands, extending [docs/style-profile.md](style-profile.md):
 | Control RPC timeout (`QP0`) | 5 ms *                        | Abort fetch, count, retry or fallback (4.1)    |
 | Bulk frame timeout (`QP1`)  | 50 ms *                       | Drop batch, retry or fallback (4.1)            |
 | Bulk batch timeout (`QP1`)  | max(50 ms, size / 1.9 GB/s) * | Drop batch, retry or fallback (4.1)            |
-| Token block size            | 256 tokens                    | Fixed protocol constant                        |
+| Token block size            | 256 to 8192 tokens            | Set per model by the runtime; reject others    |
 | Slab parallel I/O depth     | 24 (`pread`)                  | Queue in bounded ring                          |
 | Max pinned snapshots        | 4096                          | Reject `snapshot create` with explicit error   |
 
@@ -254,9 +280,9 @@ after M1, and it does not block M4. The work items of each milestone are tracked
   timeouts of section 5. M0 is the decision gate for the hardware targets: for both reference
   models it measures the cache bytes per token, the head record size and the cold prefill time at
   64k and 120k tokens. These values confirm or reduce the targets of section 3.1.
-- **M1 - `kvraild` + `vllm-mlx` Connector**: L1.5 RAM + L2 slab tiering, M5 Pro FP8
-  compression, layer-pipelined restore, zero Studio SSD writes, >= 12x TTFT speedup at 64k prefix
-  across 6 concurrent coding-agent sessions.
+- **M1 - `kvraild` + oMLX Connector**: L1.5 RAM + L2 slab tiering, the oMLX connector for
+  DeepSeek-V4.1-Flash-1017, M5 Pro FP8 compression, layer-pipelined restore, zero Studio SSD
+  writes, >= 12x TTFT speedup at 64k prefix across 6 concurrent coding-agent sessions.
 - **M2 - CoW Snapshots & Fault Injection**: `pin` / `fork` / `checkout` CLI + HTTP headers,
   hit-count >= 2 write filter, cable-pull chaos test proving zero failed inference requests in
   Full Prefix Restore.
