@@ -5,6 +5,12 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- Each `v<version>` tag also creates a GitHub Release with the wheel, the sdist and the crate,
+  taken from PyPI and crates.io, and notes from this file.
+- README badges for PyPI, crates.io, CI and the license.
+
 ## [0.0.1] - 2026-11-17
 
 ### Added

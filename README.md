@@ -1,5 +1,10 @@
 # KVRail
 
+[![PyPI](https://img.shields.io/pypi/v/kvrail)](https://pypi.org/project/kvrail/)
+[![crates.io](https://img.shields.io/crates/v/kvrail)](https://crates.io/crates/kvrail)
+[![CI](https://github.com/kvrail/kvrail/actions/workflows/ci.yml/badge.svg)](https://github.com/kvrail/kvrail/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 RDMA-over-Thunderbolt KV-cache store and context coprocessor for Apple Silicon
 (Mac mini + Mac Studio, macOS 26.2+). Early R&D; see https://kvrail.org.
 
