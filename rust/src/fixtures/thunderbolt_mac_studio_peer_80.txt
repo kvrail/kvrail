@@ -1,0 +1,91 @@
+Thunderbolt/USB4:
+
+    Thunderbolt/USB4 Bus 5:
+
+      Vendor Name: Apple Inc.
+      Device Name: Mac Studio
+      UID: 0x0000000000000000
+      Route String: 0
+      Domain UUID: 00000000-0000-0000-0000-000000000000
+      Port:
+          Status: No device connected
+          Link Status: 0x100
+          Speed: Up to 120 Gb/s
+          Receptacle: 6
+
+    Thunderbolt/USB4 Bus 4:
+
+      Vendor Name: Apple Inc.
+      Device Name: Mac Studio
+      UID: 0x0000000000000000
+      Route String: 0
+      Domain UUID: 00000000-0000-0000-0000-000000000000
+      Port:
+          Status: No device connected
+          Link Status: 0x100
+          Speed: Up to 120 Gb/s
+          Receptacle: 5
+
+    Thunderbolt/USB4 Bus 3:
+
+      Vendor Name: Apple Inc.
+      Device Name: Mac Studio
+      UID: 0x0000000000000000
+      Route String: 0
+      Domain UUID: 00000000-0000-0000-0000-000000000000
+      Port:
+          Status: Device connected
+          Link Status: 0x2
+          Speed: 80 Gb/s
+          Receptacle: 4
+
+        Mac mini:
+
+          Vendor Name: Apple Inc.
+          Device Name: Mac mini
+          Port (Upstream):
+              Status: Device connected
+              Speed: 80 Gb/s
+          Port:
+              Status: Device connected
+              Speed: Up to 40 Gb/s
+
+    Thunderbolt/USB4 Bus 2:
+
+      Vendor Name: Apple Inc.
+      Device Name: Mac Studio
+      UID: 0x0000000000000000
+      Route String: 0
+      Domain UUID: 00000000-0000-0000-0000-000000000000
+      Port:
+          Status: No device connected
+          Link Status: 0x100
+          Speed: Up to 120 Gb/s
+          Receptacle: 3
+
+    Thunderbolt/USB4 Bus 1:
+
+      Vendor Name: Apple Inc.
+      Device Name: Mac Studio
+      UID: 0x0000000000000000
+      Route String: 0
+      Domain UUID: 00000000-0000-0000-0000-000000000000
+      Port:
+          Status: No device connected
+          Link Status: 0x100
+          Speed: Up to 120 Gb/s
+          Receptacle: 2
+
+    Thunderbolt/USB4 Bus 0:
+
+      Vendor Name: Apple Inc.
+      Device Name: Mac Studio
+      UID: 0x0000000000000000
+      Route String: 0
+      Domain UUID: 00000000-0000-0000-0000-000000000000
+      Port:
+          Status: No device connected
+          Link Status: 0x100
+          Speed: Up to 120 Gb/s
+          Receptacle: 1
+
