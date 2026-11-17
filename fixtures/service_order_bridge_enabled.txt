@@ -1,0 +1,10 @@
+An asterisk (*) denotes that a network service is disabled.
+(1) Ethernet
+(Hardware Port: Ethernet, Device: en0)
+
+(2) Wi-Fi
+(Hardware Port: Wi-Fi, Device: en1)
+
+(3) Thunderbolt Bridge
+(Hardware Port: Thunderbolt Bridge, Device: bridge0)
+

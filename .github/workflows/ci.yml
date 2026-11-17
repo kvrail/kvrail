@@ -1,0 +1,73 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e . pytest
+      - run: python -m pytest -q
+      # Assertions must survive `python -O`; see docs/style-profile.md.
+      - run: python -O -m pytest -q
+      # The runner has no RDMA, so doctor exits 1. Steps run under `bash -e`, so the status is
+      # read inside an OR-list. A Python crash also exits 1, so the JSON report is checked too.
+      - run: |
+          status=0
+          kvrail doctor --json > report.json || status=$?
+          test "$status" -le 1
+          python3 -c 'import json; checks = json.load(open("report.json")); assert checks; assert all(c["id"] and c["status"] for c in checks)'
+
+  rust:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: |
+          status=0
+          cargo run --locked -- doctor --json > report.json || status=$?
+          test "$status" -le 1
+          python3 -c 'import json; checks = json.load(open("report.json")); assert checks; assert all(c["id"] and c["status"] for c in checks)'
+
+  # Proves the `rust-version` in Cargo.toml: 1.82 is the first release with Option::is_none_or.
+  rust-msrv:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: "1.82.0"
+      - run: cargo test --locked

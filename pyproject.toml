@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kvrail"
+version = "0.0.1"
+description = "KVRail: RDMA-over-Thunderbolt KV-cache store for Apple Silicon. v0.0.1 ships `kvrail doctor`, a readiness check for macOS RDMA clusters."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "KVRail", email = "hello@kvrail.org" }]
+keywords = ["rdma", "thunderbolt", "apple-silicon", "mlx", "kv-cache", "llm"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Hardware",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://kvrail.org"
+Source = "https://github.com/kvrail/kvrail"
+Issues = "https://github.com/kvrail/kvrail/issues"
+
+[project.scripts]
+kvrail = "kvrail.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kvrail"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/kvrail",
+  "/tests",
+  "/fixtures",
+  "/docs",
+  "/README.md",
+  "/LICENSE",
+  "/CHANGELOG.md",
+]

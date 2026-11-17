@@ -1,0 +1,25 @@
+[package]
+name = "kvrail"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.82"
+description = """\
+KVRail: RDMA-over-Thunderbolt KV-cache store for Apple Silicon. \
+v0.0.1 ships `kvrail doctor`."""
+license = "Apache-2.0"
+repository = "https://github.com/kvrail/kvrail"
+homepage = "https://kvrail.org"
+readme = "README.md"
+keywords = ["rdma", "thunderbolt", "apple-silicon", "kv-cache", "llm"]
+categories = ["command-line-utilities", "hardware-support"]
+include = [
+  "src/**",
+  "Cargo.toml",
+  "Cargo.lock",
+  "README.md",
+  "LICENSE",
+  "clippy.toml",
+  "rustfmt.toml",
+]
+
+[dependencies]
