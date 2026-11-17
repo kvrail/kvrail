@@ -11,8 +11,8 @@ a connected Thunderbolt 5 link at 80/120 Gb/s, and the Thunderbolt Bridge loop r
     kvrail doctor
     kvrail doctor --json --strict
 
-Exit codes: 0 when every check passes, 1 when a check fails (or warns, with `--strict`),
-2 on a usage error.
+Exit codes: 0 when every check passes, 1 when a check fails, 2 on a usage error. With
+`--strict`, a warning or a skipped check (a command that could not run) also exits 1.
 
 `kvrail doctor` runs only fixed system commands from `/usr/bin` and `/usr/sbin`, with a 15 s
 timeout and a 1 MiB output limit each. It needs no privileges and opens no network connections.

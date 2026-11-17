@@ -306,7 +306,12 @@ fn run_checks(runner: Runner, os: &str, arch: &str) -> Vec<Check> {
 fn exit_code(checks: &[Check], strict: bool) -> u8 {
     let failed = checks
         .iter()
-        .any(|check| check.status == Status::Fail || (strict && check.status == Status::Warn));
+        // Strict mode is a readiness gate: a check that could not run proves nothing.
+        .any(|check| match check.status {
+            Status::Fail => true,
+            Status::Warn | Status::Skip => strict,
+            Status::Ok | Status::Info => false,
+        });
     u8::from(failed)
 }
 
@@ -325,7 +330,10 @@ fn check_platform(os: &str, arch: &str) -> Option<Check> {
 
 fn check_macos(runner: Runner) -> Check {
     let result = runner(SW_VERS, &["-productVersion"]);
-    let output = result.success_output().unwrap_or("");
+    let Some(output) = result.success_output() else {
+        let detail = command_problem("sw_vers", &result);
+        return Check::new("macos", "macOS version", Status::Warn, &detail, "");
+    };
     let Some(version) = parse_macos_version(output) else {
         return Check::new(
             "macos",
@@ -487,8 +495,12 @@ fn parse_rdma_status(output: &str) -> Option<bool> {
 fn check_ibv(runner: Runner) -> Check {
     let title = "RDMA verbs devices";
     let result = runner(IBV_DEVICES, &[]);
+    // Rows printed by a run that then failed are not evidence of working devices.
     let output = match &result {
-        CommandResult::Exited { output, .. } => output,
+        CommandResult::Exited {
+            code: Some(0),
+            output,
+        } => output,
         CommandResult::NotFound => {
             return Check::new("ibv", title, Status::Warn, "ibv_devices not found", "");
         }
@@ -540,12 +552,14 @@ fn check_thunderbolt(runner: Runner) -> Check {
     let title = "Thunderbolt 5 link (80/120 Gb/s)";
     // Text output is parsed because the crate has no JSON parser and no dependencies.
     let result = runner(SYSTEM_PROFILER, &["SPThunderboltDataType"]);
-    let Some(output) = result
-        .success_output()
-        .filter(|output| !output.trim().is_empty())
-    else {
-        return Check::new("tb", title, Status::Skip, "system_profiler unavailable", "");
+    let Some(output) = result.success_output() else {
+        let detail = command_problem("system_profiler", &result);
+        return Check::new("tb", title, Status::Skip, &detail, "");
     };
+    if output.trim().is_empty() {
+        let detail = "system_profiler printed nothing";
+        return Check::new("tb", title, Status::Skip, detail, "");
+    }
     let Some(ports) = parse_thunderbolt_ports(output) else {
         let detail = "cannot parse system_profiler output";
         return Check::new("tb", title, Status::Warn, detail, "");
@@ -684,6 +698,8 @@ fn read_thunderbolt_port_field(port: &mut ThunderboltPort, line: &str) {
 }
 
 /// Returns the first number in a speed such as "80 Gb/s" or "Up to 120 Gb/s".
+/// Reads the first number followed by the unit "Gb/s". "800 Mb/s" is not 800 Gb/s, so a number
+/// with any other unit is rejected.
 fn parse_speed_gbps(speed: &str) -> Option<u32> {
     let start = speed.find(|c: char| c.is_ascii_digit())?;
     let rest = &speed[start..];
@@ -694,6 +710,10 @@ fn parse_speed_gbps(speed: &str) -> Option<u32> {
     if digits.len() > VERSION_COMPONENT_DIGITS_MAX {
         return None;
     }
+    let unit = rest[end..].strip_prefix(' ').unwrap_or(&rest[end..]);
+    if !unit.starts_with("Gb/s") {
+        return None;
+    }
     digits.parse().ok()
 }
 
@@ -701,13 +721,8 @@ fn check_bridge(runner: Runner) -> Check {
     let title = "Thunderbolt Bridge service";
     let result = runner(NETWORKSETUP, &["-listnetworkserviceorder"]);
     let Some(output) = result.success_output() else {
-        return Check::new(
-            "bridge",
-            title,
-            Status::Skip,
-            "networksetup unavailable",
-            "",
-        );
+        let detail = command_problem("networksetup", &result);
+        return Check::new("bridge", title, Status::Skip, &detail, "");
     };
     let Some(services) = parse_network_services(output) else {
         let detail = "cannot parse networksetup output";
@@ -991,6 +1006,20 @@ mod tests {
         check_bridge(&runner)
     }
 
+    #[test]
+    fn ibv_failed_run_is_not_evidence() {
+        // Goal: device rows from an ibv_devices run that exits nonzero do not pass.
+        let failed = CommandResult::Exited {
+            code: Some(1),
+            output: "    rdma_en2  0000\n".to_string(),
+        };
+        let checks = rdma(exited("enabled\n"), failed);
+        assert_eq!(
+            (checks[1].status, checks[1].detail.as_str()),
+            (Status::Warn, "exit code 1")
+        );
+    }
+
     fn rdma(status: CommandResult, ibv: CommandResult) -> Vec<Check> {
         let runner = fake_runner(vec![
             ("/usr/bin/rdma_ctl status", status),
@@ -1098,12 +1127,20 @@ mod tests {
 
     #[test]
     fn thunderbolt_unavailable_or_empty() {
-        // Goal: a failed command skips, and output without ports warns.
+        // Goal: a failed command skips with its reason, and output without ports warns.
         let runner = fake_runner(vec![]);
         let check = check_thunderbolt(&runner);
         assert_eq!(
             (check.status, check.detail.as_str()),
-            (Status::Skip, "system_profiler unavailable")
+            (Status::Skip, "system_profiler not found")
+        );
+        let runner = fake_runner(vec![(
+            "/usr/sbin/system_profiler SPThunderboltDataType",
+            CommandResult::Timeout,
+        )]);
+        assert_eq!(
+            check_thunderbolt(&runner).detail,
+            "system_profiler timed out after 15 s"
         );
         let check = thunderbolt("Thunderbolt/USB4:\n\n");
         assert_eq!(check.status, Status::Warn);
@@ -1117,6 +1154,8 @@ mod tests {
         assert_eq!(parse_speed_gbps("Up to 120 Gb/s"), Some(120));
         assert_eq!(parse_speed_gbps("Up to 40 Gb/s"), Some(40));
         assert_eq!(parse_speed_gbps("fast"), None);
+        assert_eq!(parse_speed_gbps("800 Mb/s"), None);
+        assert_eq!(parse_speed_gbps("80Gb/s"), Some(80));
         assert_eq!(parse_speed_gbps("99999 Gb/s"), None);
     }
 
@@ -1189,7 +1228,7 @@ mod tests {
         let check = check_bridge(&fake_runner(vec![]));
         assert_eq!(
             (check.status, check.detail.as_str()),
-            (Status::Skip, "networksetup unavailable")
+            (Status::Skip, "networksetup not found")
         );
         let service = "(1) Ethernet\n(Hardware Port: Ethernet, Device: en0)\n";
         assert_eq!(
@@ -1314,9 +1353,10 @@ mod tests {
             (garbage.status, garbage.title),
             (Status::Warn, "macOS version")
         );
+        assert_eq!(garbage.detail, "cannot read sw_vers");
         assert_eq!(
             check_macos(&fake_runner(vec![])).detail,
-            "cannot read sw_vers"
+            "sw_vers not found"
         );
     }
 
@@ -1411,12 +1451,13 @@ mod tests {
 
     #[test]
     fn exit_code_strict() {
-        // Goal: warnings fail only with --strict, and fails always fail.
+        // Goal: warnings and skips fail only with --strict, and fails always fail.
         let warn = Check::new("tb", "Thunderbolt", Status::Warn, "", "");
         let skip = Check::new("bridge", "Bridge", Status::Skip, "", "");
         assert_eq!(exit_code(&[warn.clone(), skip.clone()], false), 0);
         assert_eq!(exit_code(&[warn, skip.clone()], true), 1);
-        assert_eq!(exit_code(std::slice::from_ref(&skip), true), 0);
+        assert_eq!(exit_code(std::slice::from_ref(&skip), false), 0);
+        assert_eq!(exit_code(std::slice::from_ref(&skip), true), 1);
         let fail = Check::new("macos", "macOS", Status::Fail, "", "");
         assert_eq!(exit_code(&[skip, fail], false), 1);
     }

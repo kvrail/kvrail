@@ -25,9 +25,13 @@ jobs:
       - run: python -m pytest -q
       # Assertions must survive `python -O`; see docs/style-profile.md.
       - run: python -O -m pytest -q
-      # The runner has no RDMA, so doctor exits 1. Steps run under `bash -e`, so the status
-      # is read inside an OR-list; only a usage error (2) or a crash fails the step.
-      - run: kvrail doctor || test $? -le 1
+      # The runner has no RDMA, so doctor exits 1. Steps run under `bash -e`, so the status is
+      # read inside an OR-list. A Python crash also exits 1, so the JSON report is checked too.
+      - run: |
+          status=0
+          kvrail doctor --json > report.json || status=$?
+          test "$status" -le 1
+          python3 -c 'import json; checks = json.load(open("report.json")); assert checks; assert all(c["id"] and c["status"] for c in checks)'
 
   rust:
     runs-on: macos-latest
@@ -46,7 +50,11 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
-      - run: cargo run --locked -- doctor || test $? -le 1
+      - run: |
+          status=0
+          cargo run --locked -- doctor --json > report.json || status=$?
+          test "$status" -le 1
+          python3 -c 'import json; checks = json.load(open("report.json")); assert checks; assert all(c["id"] and c["status"] for c in checks)'
 
   # Proves the `rust-version` in Cargo.toml: 1.82 is the first release with Option::is_none_or.
   rust-msrv:

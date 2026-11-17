@@ -23,7 +23,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="check this Mac for RDMA-over-Thunderbolt readiness",
     )
     doctor.add_argument("--json", action="store_true", help="machine-readable output")
-    doctor.add_argument("--strict", action="store_true", help="treat warnings as failures")
+    doctor.add_argument(
+        "--strict",
+        action="store_true",
+        help="treat warnings and skipped checks as failures",
+    )
     arguments = parser.parse_args(argv)
 
     if arguments.command is None:

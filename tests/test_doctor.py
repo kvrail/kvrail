@@ -67,6 +67,7 @@ def test_rdma_enabled_device_states():
     listed = "    device   node GUID\n    ------   ----\n    rdma_en2  0000\n    rdma_en3\n"
     assert d.parse_ibv_devices(listed) == ["rdma_en2", "rdma_en3"]
     assert statuses(exited(listed)) == [d.Status.ok, d.Status.ok]
+    assert statuses(exited(listed, exit_code=1)) == [d.Status.ok, d.Status.warn]
     assert d.parse_ibv_devices("    rdma_enx 0\n    rdma_en2x 0\n") == []
 
 
@@ -120,7 +121,9 @@ def test_thunderbolt_malformed_output():
         [check] = d.check_thunderbolt(runner_from({"system_profiler": exited(output)}))
         assert check.status == d.Status.warn, output[:60]
     [check] = d.check_thunderbolt(runner_from({"system_profiler": exited("", 1)}))
-    assert check.status == d.Status.skip
+    assert (check.status, check.detail) == (d.Status.skip, "exit code 1")
+    hung = runner_from({"system_profiler": d.CommandResult(d.Outcome.timeout)})
+    assert d.check_thunderbolt(hung)[0].detail == "system_profiler timed out after 15 s"
 
 
 def test_bridge_detection():
@@ -163,6 +166,9 @@ def test_exit_codes():
     fail = [d.Check("a", "A", d.Status.info), d.Check("b", "B", d.Status.fail)]
     assert d.exit_code(warn, strict=False) == 0
     assert d.exit_code(warn, strict=True) == 1
+    skip = [d.Check("a", "A", d.Status.skip)]
+    assert d.exit_code(skip, strict=False) == 0
+    assert d.exit_code(skip, strict=True) == 1
     assert d.exit_code(fail, strict=False) == 1
 
 

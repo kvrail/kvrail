@@ -197,7 +197,8 @@ def exit_code(checks: List[Check], strict: bool) -> int:
     for check in checks:
         if check.status == Status.fail:
             return 1
-        if strict and check.status == Status.warn:
+        # Strict mode is a readiness gate: a check that could not run proves nothing.
+        if strict and check.status in (Status.warn, Status.skip):
             return 1
     return 0
 
@@ -257,7 +258,10 @@ def check_platform(runner: Runner) -> List[Check]:
         return [Check("platform", title, Status.fail, platform.machine(), hint)]
 
     result = runner(["sw_vers", "-productVersion"])
-    version = parse_macos_version(result.output) if result.succeeded else None
+    if not result.succeeded:
+        detail = command_problem("sw_vers", result)
+        return [Check("macos", "macOS version", Status.warn, detail)]
+    version = parse_macos_version(result.output)
     if version is None:
         return [Check("macos", "macOS version", Status.warn, "cannot read sw_vers")]
     title = "macOS >= 26.2 (RDMA over Thunderbolt)"
@@ -316,7 +320,8 @@ def check_rdma_devices(runner: Runner) -> Check:
     result = runner(["ibv_devices"])
     if result.outcome == Outcome.not_found:
         return Check("ibv", title, Status.warn, "ibv_devices not found")
-    if result.outcome != Outcome.exited:
+    if not result.succeeded:
+        # Rows printed by a run that then failed are not evidence of working devices.
         return Check("ibv", title, Status.warn, command_problem("ibv_devices", result))
     try:
         devices = parse_ibv_devices(result.output)
@@ -333,7 +338,12 @@ def check_rdma_devices(runner: Runner) -> Check:
 
 def command_problem(name: str, result: CommandResult) -> str:
     """Describe a command that produced no usable output, in the same words as the Rust CLI."""
-    invariant(result.outcome != Outcome.exited)
+    invariant(not result.succeeded)
+    if result.outcome == Outcome.exited:
+        # A negative return code is how `subprocess` reports a process stopped by a signal.
+        if result.exit_code < 0:
+            return "stopped by a signal"
+        return f"exit code {result.exit_code}"
     if result.outcome == Outcome.not_found:
         return f"{name} not found"
     if result.outcome == Outcome.timeout:
@@ -346,8 +356,10 @@ def command_problem(name: str, result: CommandResult) -> str:
 def check_thunderbolt(runner: Runner) -> List[Check]:
     title = "Thunderbolt 5 link (80/120 Gb/s)"
     result = runner(["system_profiler", "SPThunderboltDataType", "-json"])
-    if not result.succeeded or not result.output.strip():
-        return [Check("tb", title, Status.skip, "system_profiler unavailable")]
+    if not result.succeeded:
+        return [Check("tb", title, Status.skip, command_problem("system_profiler", result))]
+    if not result.output.strip():
+        return [Check("tb", title, Status.skip, "system_profiler printed nothing")]
     try:
         ports = parse_thunderbolt_ports(result.output)
     except ValueError:
@@ -380,7 +392,7 @@ def check_bridge(runner: Runner) -> List[Check]:
     title = "Thunderbolt Bridge service"
     result = runner(["networksetup", "-listnetworkserviceorder"])
     if not result.succeeded:
-        return [Check("bridge", title, Status.skip, "networksetup unavailable")]
+        return [Check("bridge", title, Status.skip, command_problem("networksetup", result))]
     try:
         services = parse_service_order(result.output)
     except ValueError:
