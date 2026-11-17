@@ -69,7 +69,8 @@ Six commands at 15 s each bound one run at 90 s.
 - Runtime dependencies: none, in both implementations.
 - Build: `hatchling` (Python wheel), Cargo. `Cargo.lock` is committed.
 - Minimum Rust version: 1.82, the first release with `Option::is_none_or`. CI proves it.
-- CI actions are pinned by commit hash. Publishing uses OIDC trusted publishing; no long-lived
+- CI actions are pinned by commit hash. A `v<version>` tag runs `release.yml`, which publishes
+  both packages through OIDC trusted publishing; no long-lived
   token is stored in the repository.
 - Checks that run in CI: `pytest` (includes the line and function length test), `cargo fmt
   --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
