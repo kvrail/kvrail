@@ -33,10 +33,13 @@ Non-goals:
   links between co-located Macs.
 - Multimodal inputs (images, video, audio). KVRail does not verify how a runtime keys them, so the
   connector bypasses the store for every request that contains them.
-- Adapters and runtime options that change the cache. The block address covers the checkpoint and
-  the token IDs only. The connector therefore bypasses the store, for reads and for writes, when
-  the loaded model has an adapter (request field `adapters` or server flag `--adapter-path`), a
-  draft model, KV quantization (`--kv-bits`), a bounded cache (`--max-kv-size`) or SpecPrefill.
+- Adapters and runtime options that change the cache. The namespace covers the checkpoint and the
+  cache signature of the runtime, and the block hash covers the token IDs (section 4.2). An option
+  outside these inputs changes the cache without a change of the address. The connector therefore
+  bypasses the store, for reads and for writes, when the loaded model has an adapter (request
+  field `adapters` or server flag `--adapter-path`), a draft model, KV quantization (`--kv-bits`),
+  a bounded cache (`--max-kv-size`) or SpecPrefill. It also bypasses the store for a numerics mode
+  that M1 does not test: the CED prefill and the A8 prefill of DeepSeek-V4.1, and the fp16 recast.
   KVRail does not treat MTP decoding as such an option: oMLX keeps the MTP cache outside the
   prompt cache, so requests with MTP use the store. M1 verifies that MTP does not change the
   output after a restore (section 4.3).
@@ -45,10 +48,14 @@ Non-goals:
 
 ### Single-user power workflows (1x Mac Studio + 1x Context Brick)
 
-1. Concurrent coding-agent swarm without eviction thrashing: 5-10 active Claude Code / OpenHands
-   sessions (60k-120k tokens each) switch in <= 1.0 s over RDMA (section 3.1) instead of 60-150 s
-   cold prefill when a 375-420 GiB MoE model leaves < 80 GiB of GPU wired headroom on a 512 GiB
-   Studio.
+1. Coding-agent swarm that keeps its warm prefixes: 5-10 active Claude Code / OpenHands sessions
+   (60k-120k tokens each) keep their prefixes through a restart of the runtime (use case 4) and
+   share them with a second Studio (use case 6). A session that the Studio does not hold switches
+   in <= 1.0 s over RDMA (section 3.1) instead of 60-150 s cold prefill. The estimates of section
+   3.1 do not show memory pressure for this workload: ten sessions of 120k tokens take 1.0 GiB
+   with DeepSeek-V4.1-Flash-1017 and 32 GiB with Qwen3.8-Flash-Next, and a 375-420 GiB MoE model
+   leaves about 80 GiB of GPU wired headroom on a 512 GiB Studio. Memory pressure is a hypothesis:
+   M0 measures it with the runtime allocations and the prefill buffers (section 6).
 2. `git checkout` for model memory: freeze a 100k-token repository + spec state (`snapshot create`),
    fork 3 sub-agent branches in < 1 ms with zero block duplication (`snapshot fork`), and discard
    dead-end branches without polluting the trunk context.
@@ -120,8 +127,8 @@ Consequences:
   blocks of 8192 tokens (218 MiB), a stored session takes about 1.5 times the session size of the
   table. A restore reads one head record, so the switch time does not change.
 - The hardware targets (two rails, 8 TB RAID) therefore depend on the model. M0 measures the cache
-  size and the cold prefill time on the reference hardware, and confirms or reduces these targets
-  (section 6).
+  size, the cold prefill time and the baseline of oMLX without KVRail on the reference hardware.
+  The targets stay conditional on these measurements: M0 confirms or reduces them (section 6).
 - The connector runtime for both reference models is oMLX. oMLX already has a block cache with a
   RAM tier and an SSD tier, and both models use the same block hash, index and tiers. KVRail takes
   the place of the SSD tier and adds sharing between Studios (section 4.3).
@@ -160,7 +167,7 @@ same frame count as the send, or the receive fails. KVRail opens three QPs per p
   ID, and the sender ends a transfer at its last chunk or at the batch deadline.
 - `QP2 (Speculative Stream)`: optional 1-16 KiB low-latency channel for 14 KiB `hidden_state`
   vectors and draft token trees (`mlx-dspark`, EAGLE-family DSpark / DFlash drafters) when Studio
-  memory exceeds 92% capacity.
+  memory exceeds 92% capacity. This channel is research (M5, section 6).
 
 Connection setup: the peers exchange GIDs, QP numbers and packet sequence numbers over a TCP
 connection on the paired Thunderbolt IP interface, as TN3205 describes. Each RDMA port therefore
@@ -197,12 +204,13 @@ When no rail is left:
 
 A retry can repeat an RPC that the peer already applied, because the lost message can be the ACK.
 Every mutating `QP0` RPC is therefore idempotent: `PutMeta` is keyed by the block address
-(namespace and block hash) and the part (rows or head record), `Drop` names a block address, and
-`ForkSnapshot` carries a snapshot ID that the client chooses. A retry sends the same request on
-the other rail, and the receiver returns the existing result. A repeated `Drop` can remove a
-block that another Studio wrote again after the first `Drop`. The address covers the content, so
-the result is one more prefill and no wrong data. A sequence number belongs to one QP: it matches
-an ACK to its request and does not identify an operation.
+(namespace and block hash), the part (rows or head record) and the write generation of its unit
+(section 4.2), `Drop` names a block address, and `ForkSnapshot` carries a snapshot ID that the
+client chooses. A retry sends the same request on the other rail, and the receiver returns the
+existing result. A repeated `Drop` can remove a block that another Studio wrote again after the
+first `Drop`. The address covers the content, so the result is one more prefill and no wrong
+data. A sequence number belongs to one QP: it matches an ACK to its request and does not identify
+an operation.
 
 ### 4.2 Storage and indexing daemon (`kvraild` on Mac mini)
 
@@ -220,14 +228,20 @@ an ACK to its request and does not identify an operation.
   `BLAKE3(model_uuid || quant_fmt || cache format of the runtime)`. `model_uuid` is a digest of
   the (file name, file hash) pairs, sorted by name, of the weight files and `config.json` of the
   loaded checkpoint, so it identifies the exact weights; the connector computes it for each model
-  that it loads. `quant_fmt` is the quantization of the model weights. The cache format of the
-  runtime includes the block size and, for oMLX, the storage mode and the value type of the
-  DeltaNet state. When the runtime has its own chained block hash, KVRail uses that hash as the
-  address and computes no second hash: oMLX chains SHA-256 over the model name, the parent hash,
-  the token IDs and the image hashes, and the connector sets one model name on every Studio of a
-  store. Without such a hash, the connector
-  computes `H_i = BLAKE3(H_{i-1} || token IDs of block i)`. Both hashes are collision resistant,
-  so crafted prompt text cannot alias another block; `xxHash64` stays as the frame checksum. The
+  that it loads. `quant_fmt` is the quantization of the model weights. For oMLX, the cache format
+  of the runtime is its complete compatibility signature and the storage mode of the DeltaNet
+  state. The signature has the model name, the layer count, the block size, the cache class of
+  each layer, the payload layout, the value type of the DeltaNet state and the numerics revision.
+  The numerics revision separates blocks that the same weights compute in another way: the fp16
+  recast, the CED prefill and the A8 prefill. The same checkpoint files and the same tensor
+  layout therefore do not prove that two blocks are compatible. The store keeps the signature
+  with each block, and the connector keeps the check of oMLX that rejects a block with another
+  signature at a restore. When the runtime has its own chained block hash, KVRail uses that hash
+  as the address and computes no second hash: oMLX chains SHA-256 over the model name, the parent
+  hash, the token IDs and the image hashes, and the connector sets one model name on every Studio
+  of a store. Without such a hash, the connector computes
+  `H_i = BLAKE3(H_{i-1} || token IDs of block i)`. Both hashes are collision resistant, so
+  crafted prompt text cannot alias another block; `xxHash64` stays as the frame checksum. The
   encoding of a stored block (FP16/BF16, FP8, Affine4) is block metadata and not part of the
   address, so recompression keeps the address.
 - Block content: the cache rows that grow with the tokens of the block (KV, compressed KV, index
@@ -237,14 +251,20 @@ an ACK to its request and does not identify an operation.
   Qwen3.8-Flash-Next, the connector requires the `ssd_sidecar` mode of oMLX with `fp32` state.
   oMLX then writes the DeltaNet state of each block boundary to a separate file, with the hash of
   that block as the key, and it does not keep a block without this file. The store keeps this
-  file as the head record of the block. A block and its head record are one unit. The connector
-  sends both parts of a unit together (section 4.3). `Lookup` reports the unit only when
-  the store holds both parts, and the store evicts both parts together. A part without the other
-  part is the first that the store evicts. A `Get` names the part that it reads, so a restore
-  reads the rows of every block and the head record of the last block only. A restore resumes
-  from the longest cached prefix, and the Studio prefills the tokens after it. Blocks of 256
-  tokens with a head record of this size need a rule for the blocks that keep a head record; such
-  a runtime is outside M0-M4.
+  file as the head record of the block. A block and its head record are one unit; for
+  DeepSeek-V4.1 the unit has one part. The connector sends the parts of a unit together (section
+  4.3), in one write generation with an ID that the client chooses. The store commits a unit when
+  all its parts of one generation pass the checksum, and `Lookup` and `Get` see committed units
+  only. The first generation that the store accepts for an address wins. Until this generation
+  commits or expires, and after the commit, the store answers a put of another generation with
+  the existing result, and that client sends no data. The store discards the parts of a
+  generation that does not complete; the block is then absent, and a later request writes it
+  again. A committed unit changes only when the pipeline publishes a new version of it. The store
+  evicts both parts together. A `Get` names the part that it reads, so a restore reads the rows
+  of every block and the head record of the last block only. A restore resumes from the longest
+  cached prefix, and the Studio prefills the tokens after it. Blocks of 256 tokens with a head
+  record of this size need a rule for the blocks that keep a head record; such a runtime is
+  outside M0-M5.
 - L1.5 Hot Pool (48 GiB unified memory): pinned ring of page-aligned buffers registered once with
   `ibv_reg_mr` at startup. Starts the transfer of hot prefixes and active snapshot heads in
   < 1 ms (time to the first chunk); section 3.1 gives the transfer time. The RAM tier of the
@@ -262,9 +282,21 @@ an ACK to its request and does not identify an operation.
   and disk reduction). It stores blocks that the runtime already packs as they are: oMLX packs the
   DeepSeek-V4.1 cache to FP4 and FP8. The pipeline publishes the recompressed data and its
   encoding together as one new version of the block; a reader sees the old version or the new
-  version, never a mix.
+  version, never a mix. The recompression is lossy. The pipeline is off until M2 accepts its
+  quality criterion (section 6), and it does not change a block that a snapshot references.
 - CoW Radix index: reference-counted prefix nodes supporting `snapshot create`, `snapshot fork`,
   and `snapshot drop` in O(depth) metadata updates with append-only journal checkpoints.
+- Snapshot precision: a snapshot is exact. It keeps the representation that each of its blocks
+  has when the store publishes it, so each checkout of a snapshot restores the same cache bytes.
+  A block outside a snapshot is a cache entry, and the pipeline can change its representation. A
+  snapshot policy that permits such a change is approximate. It needs its own quality criterion
+  and is outside M0-M5.
+- Snapshot admission: a block that a snapshot references is pinned. Before the store publishes a
+  snapshot, it reserves the bytes of the units that this snapshot pins and that no earlier
+  snapshot pins. The capacity check does not assume that later snapshots share a prefix. If the
+  pinned bytes with this reservation exceed the limit of section 5, the store rejects the
+  snapshot with an explicit capacity error and releases the reservation. A rejected extension of
+  a snapshot leaves the previous snapshot intact.
 
 ### 4.3 Compute connector (oMLX / `vllm-mlx` on Mac Studio)
 
@@ -305,12 +337,12 @@ an ACK to its request and does not identify an operation.
   the store keeps no state between frames. The connector stops at the first frame that the store
   does not hold completely. The connector cannot compute the hash of a tail block, because it
   does not know the length of that block. The answer therefore also lists the tail blocks that
-  follow the last block of the run, each with its token count. It lists the newest tail blocks
-  first, and at most as many as one frame holds. The connector computes the hash for each count
-  and uses the tail block that matches its prompt; without a match it prefills. A hit adds the
-  blocks to the local index. This is how a Studio finds the blocks that another Studio wrote.
-  After a restart of the runtime the connector does not copy the index from the store; the index
-  fills again through these lookups.
+  follow the last block of the run, each with its token count. It lists at most as many tail
+  blocks as one frame holds; the M1 design sets their order (section 4.4). The connector computes
+  the hash for each count and uses the tail block that matches its prompt; without a match it
+  prefills. A hit adds the blocks to the local index. This is how a Studio finds the blocks that
+  another Studio wrote. After a restart of the runtime the connector does not copy the index from
+  the store; the index fills again through these lookups.
 - Stale index entry: an entry of the local index is a hint. The store does not pin the blocks that
   a lookup returns, and it can evict a block before the read starts. The store then answers the
   `Get` with the status `miss`. The connector removes the block from the local index, resumes
@@ -319,7 +351,7 @@ an ACK to its request and does not identify an operation.
   4.1.
 - `vllm-mlx`: the connector replaces `SSDCacheTier`. This path covers models whose cache consists
   of `KVCache`, `CacheList` and `ArraysCache` layers. Neither reference model uses this path, and
-  it is outside M0-M4.
+  it is outside M0-M5.
 - Full Prefix Restore (every session that fits Studio memory): pipelined layer-wise prefetch over
   `QP1` (layer `L+1` arrives into pre-registered `MTLBuffer` slots while Studio GPU computes layer
   `L`), plus the head record of the resume position.
@@ -331,14 +363,15 @@ an ACK to its request and does not identify an operation.
   when the session grows. It creates the new snapshot before it drops the old one, and before it
   removes rows from Studio memory. The store drops the session snapshots of a Studio when the
   runtime of that Studio connects again after a restart. A session snapshot counts against the
-  limit of pinned snapshots (section 5). The store writes each block that a snapshot references
-  to L2 and does not evict it (section 4.2), so the admission filter cannot remove a row that the
-  indexer selects later. If the store rejects the snapshot, the request fails with the explicit
-  error. KVRail does not replace the selection of the indexer with its own scoring, so the model
-  output does not change when the fetched rows have the same encoding as the rows in memory. A
-  block that the pipeline recompressed to FP8 or Affine4 is lossy and can change the output.
+  limits of pinned snapshots and of pinned bytes (section 5). The store writes each block that a
+  snapshot references to L2 and does not evict it (section 4.2), so the admission filter cannot
+  remove a row that the indexer selects later. If the store rejects the snapshot, the previous
+  snapshot stays, and the request fails with the explicit error. KVRail does not replace the
+  selection of the indexer with its own scoring, so the model output does not change when the
+  fetched rows have the same encoding as the rows in memory. The pipeline does not recompress the
+  blocks of a session snapshot (section 4.2).
 
-### 4.4 Open points for the M0 and M1 design
+### 4.4 Open points for the milestone design documents
 
 These points do not change the rules above. The design document of the named milestone settles
 each of them.
@@ -356,9 +389,12 @@ each of them.
 - Boundary state of DeepSeek-V4.1 (M0): the snapshot can also hold the rows of one block, so M0
   measures its size.
 - Order of the tail list (M1): oMLX keeps up to 32 tail blocks under one parent, and one frame
-  holds about 6. The order must keep the tail block of a shared system prefix in the answer.
-- Part of a unit (M1): the store must not evict one part while the write of the other part is in
-  progress.
+  holds about 6. The order, or a continuation of the list, must keep the tail block of a shared
+  system prefix in the answer. A tail block outside the answer costs one prefill and gives no
+  wrong data.
+- Write generation (M1): the time after which an incomplete generation expires.
+- Quality criterion of the lossy recompression (M2): the metric, the prompt set and the
+  threshold.
 - `Drop` during a read (M1): the behavior when a Studio drops a block that another Studio reads.
 - Scope of the oMLX patch (M1): oMLX commits a state file only from a staged file, so the patch
   changes more than file I/O.
@@ -383,18 +419,20 @@ module lands, extending [docs/style-profile.md](style-profile.md):
 | Prefill boundary states     | 1.5 GiB of Studio memory *    | Send each unit at its block boundary (4.3)     |
 | Slab parallel I/O depth     | 24 (`pread`)                  | Queue in bounded ring                          |
 | Max pinned snapshots        | 4096                          | Reject `snapshot create` with explicit error   |
+| Max pinned bytes            | 3.5 TiB (half of L2) *        | Reject the snapshot; keep the previous one     |
 
 Limits marked `*` are provisional. M0 replaces the timeouts with values derived from the measured
 latency distribution, and confirms the limit of boundary states from the measured head record
-size. The limits of Out-of-Core Retrieval are set when the M3 research ends; they include the
-bytes that session snapshots hold.
+size. M2 confirms the limit of pinned bytes. The count limit alone does not protect the slab:
+4096 independent snapshots of a 120k-token session of Qwen3.8-Flash-Next (4.70 GiB each) take
+18.8 TiB. The other limits of Out-of-Core Retrieval are set when the M3 research ends.
 
 ## 6. Milestones and acceptance KPIs
 
 Milestones have no dates. Each milestone is a gate: the next milestone starts only when the
-acceptance KPIs of the current one pass. The order is M0, M1, M2, M4. M3 is research: it can start
-after M1, its acceptance needs the snapshots of M2, and it does not block M4. The work items of
-each milestone are tracked in the
+acceptance KPIs of the current one pass. The order is M0, M1, M2, M4. M3 and M5 are research, and
+neither blocks M4. M3 can start after M1, and its acceptance needs the snapshots of M2. M5 can
+start after M1. The work items of each milestone are tracked in the
 [GitHub milestones](https://github.com/kvrail/kvrail/milestones) of the same names.
 
 - **M0 - Wire & Slab Core**: `librdma` 1-rail and 2-rail zero-copy `MTLBuffer` benchmark
@@ -404,23 +442,41 @@ each milestone are tracked in the
   models it measures the cache bytes per token, the head record size and the cold prefill time at
   64k and 120k tokens. These values confirm or reduce the targets of section 3.1. M0 also defines
   the `QP0` and `QP1` frame layouts and settles the transport points of section 4.4.
+  M0 also measures the baseline without KVRail: oMLX with its own RAM and SSD cache on the
+  reference Studio, for both reference models and the workload of use case 1. The baseline has
+  the end-to-end TTFT distribution (p50, p95, p99) for a warm prefix, for a prefix after a
+  restart of the runtime and for a cold prefill. It also has the peak memory of the Studio, with
+  the runtime allocations and the prefill buffers. The baseline shows whether use case 1 has
+  memory pressure, and M0 sets from it the threshold for the comparison of M1.
 - **M1 - `kvraild` + oMLX Connector**: L1.5 RAM + L2 slab tiering, the oMLX connector for both
-  reference models with head records for the DeltaNet state, M5 Pro FP8 compression,
-  layer-pipelined restore, zero Studio SSD writes, >= 12x TTFT speedup at 64k prefix across 6
-  concurrent coding-agent sessions with DeepSeek-V4.1-Flash-1017, for Qwen3.8-Flash-Next the same
-  token output at temp=0 after a restore from the store at 64k tokens as after a cold prefill
-  (blocks without recompression), and the MTP comparison of section 4.3.
-- **M2 - CoW Snapshots & Fault Injection**: `pin` / `fork` / `checkout` CLI + HTTP headers,
-  hit-count >= 2 write filter, cable-pull chaos test proving zero failed inference requests in
-  Full Prefix Restore.
+  reference models with head records for the DeltaNet state, layer-pipelined restore, and zero
+  Studio SSD writes. Correctness: for both reference models, the same token output at temp=0
+  after a restore from the store at 64k tokens as after a cold prefill, with the same host, the
+  same runtime settings and no recompression. The test covers a prefix that ends at a block
+  boundary, a prefix that ends in a tail block, and a partial hit with more prefill after it. The
+  MTP comparison of section 4.3 is a second test. Performance: >= 12x TTFT speedup against a cold
+  prefill at 64k prefix across 6 concurrent coding-agent sessions with DeepSeek-V4.1-Flash-1017.
+  M1 also measures the end-to-end TTFT distribution of KVRail against the M0 baseline, with the
+  same prompts, concurrency and memory budget, for a warm prefix and after a restart of the
+  runtime. The result must pass the threshold that M0 sets.
+- **M2 - CoW Snapshots & Fault Injection**: `pin` / `fork` / `checkout` CLI + HTTP headers, exact
+  snapshots with the admission of pinned bytes (section 4.2), hit-count >= 2 write filter, and
+  cable-pull chaos test proving zero failed inference requests in Full Prefix Restore. M2 also
+  defines the quality criterion of the M5 Pro recompression pipeline (FP8 / Affine4). The pipeline
+  stays off when the criterion does not pass; this result does not block the gate.
 - **M3 (research) - Out-of-Core Retrieval**: the Studio keeps the index keys, and the Mac mini
   serves the rows that the indexer of the model selects. Acceptance: identical token output at
-  temp=0 with and without out-of-core mode when both runs use the same block encoding, and >= 75%
-  of 8k decode tok/s sustained at 256k-512k context. Cable-pull test: a session continues on the
-  remaining rail, and fails with the explicit error when no rail is left.
-- **M4 - Multi-Studio Sharing, `QP2` Draft & 24h Soak**: dual-Studio cache sharing test,
-  `QP2` speculative draft experiment at > 92% Studio RAM occupancy (>= 1.6x decode at temp=0),
-  and 24-hour agent-swarm soak test with zero `ibv_mr` / `MTLBuffer` leaks. An M3 Ultra and an
-  M5 Ultra compute the same block with different kernels. The sharing test therefore compares the
-  token output at temp=0 of a Studio from its own blocks and from the blocks of a Studio of the
-  other type. If the outputs differ, the host type becomes part of the namespace.
+  temp=0 with and without out-of-core mode when both runs use the same block encoding, and a
+  decode rate at a context of 256k-512k tokens of >= 75% of the decode rate (tok/s) that the same
+  model reaches at a context of 8k tokens on the same Studio. Cable-pull test: a session
+  continues on the remaining rail, and fails with the explicit error when no rail is left.
+- **M4 - Multi-Studio Sharing & 24h Soak**: dual-Studio cache sharing test, and 24-hour
+  agent-swarm soak test with zero `ibv_mr` / `MTLBuffer` leaks. The sharing test measures the
+  TTFT distribution of a Studio for a prefix that the other Studio wrote, against the M0
+  baseline. An M3 Ultra and an M5 Ultra compute the same block with different kernels. The
+  sharing test therefore compares the token output at temp=0 of a Studio from its own blocks and
+  from the blocks of a Studio of the other type. If the outputs differ, the host type becomes
+  part of the namespace.
+- **M5 (research) - `QP2` Speculative Drafting**: `QP2` speculative draft experiment at > 92%
+  Studio RAM occupancy. Acceptance: >= 1.6x decode rate at temp=0 against the same model without
+  drafting, with the same token output. M5 does not block M4 or a release of the cache sharing.

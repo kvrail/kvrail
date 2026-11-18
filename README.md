@@ -26,7 +26,7 @@ timeout and a 1 MiB output limit each. It needs no privileges and opens no netwo
 
 - `src/kvrail`, `tests/`, `fixtures/`: Python package (stdlib only)
 - `rust/`: Rust crate with the same `doctor` command, zero dependencies
-- `docs/architecture.md`: system specification, use cases, RDMA/slab design and M0-M4 KPIs
+- `docs/architecture.md`: system specification, use cases, RDMA/slab design and M0-M5 KPIs
 - `docs/style-profile.md`: the project profile for
   [TigerStyle](https://github.com/kvrail/tigerstyle), with limits and threat model
 - `.github/workflows/`: CI and trusted-publishing workflows
