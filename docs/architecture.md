@@ -37,8 +37,8 @@ Non-goals:
   the token IDs only. The connector therefore bypasses the store, for reads and for writes, when
   the loaded model has an adapter (request field `adapters` or server flag `--adapter-path`), a
   draft model, KV quantization (`--kv-bits`), a bounded cache (`--max-kv-size`) or SpecPrefill.
-  M1 defines how the store handles the MTP cache that a runtime appends, because both reference
-  checkpoints use MTP.
+  MTP decoding is not such an option: oMLX keeps the MTP cache outside the prompt cache, so
+  requests with MTP use the store (section 4.3).
 
 ## 2. Target use cases
 
@@ -52,7 +52,7 @@ Non-goals:
    fork 3 sub-agent branches in < 1 ms with zero block duplication (`snapshot fork`), and discard
    dead-end branches without polluting the trunk context.
 3. Research: context beyond Studio memory. A 1M-token session of the Qwen4 architecture takes
-   25.9 GiB of cache, and three such sessions fill the Studio headroom. The Studio keeps the index
+   26.1 GiB of cache, and three such sessions fill the Studio headroom. The Studio keeps the index
    keys and fetches from the Mac mini only the rows that the indexer of the model selects (M3).
 4. Immortal warm cache across restarts: restarting the runtime, changing flags, or rebooting the
    Studio leaves intact every block that the store holds in the Mac mini's 48 GiB L1.5 RAM and
@@ -87,15 +87,14 @@ Non-goals:
 
 ### 3.1 Reference models and cache sizing
 
-KVRail sizes its targets against two models. The values are estimates until M0 measures them. The
-values for DeepSeek-V4.1-Flash-1017 come from the memory estimator of oMLX, which packs the cache
-to FP4 and FP8. The values for Qwen3.8-Flash-Next come from the `mlx-lm` source with 16-bit cache
-values.
+KVRail sizes its targets against two models. The values are estimates until M0 measures them.
+They come from the memory estimator of oMLX and from the model configs. oMLX packs the cache of
+DeepSeek-V4.1-Flash-1017 to FP4 and FP8, and keeps 16-bit values for Qwen3.8-Flash-Next.
 
 | Model                    | Growth per token | Head record | 120k session | Switch, 1 / 2 cables |
 |--------------------------|------------------|-------------|--------------|----------------------|
 | DeepSeek-V4.1-Flash-1017 | 890 B            | 2.6 MiB     | 0.10 GiB     | 0.03 s / 0.02 s      |
-| Qwen3.8-Flash-Next       | 27,648 B         | 108 MiB     | 3.20 GiB     | 0.90 s / 0.50 s      |
+| Qwen3.8-Flash-Next       | 27,936 B         | 108 MiB     | 3.23 GiB     | 0.91 s / 0.51 s      |
 
 - DeepSeek-V4.1-Flash-1017 (MLX checkpoint 402 GiB, the model of use case 1): each of 40 layers
   keeps a sliding window of 128 tokens; four source layers add compressed KV and index keys, 2.5
@@ -113,18 +112,19 @@ Consequences:
 - With DeepSeek-V4.1-Flash-1017, the 80 GiB headroom of the Studio holds about 780 sessions of
   120k tokens. For this model the store gives restart survival, snapshots and sharing between
   Studios. Its switch time does not need two rails, and its cache does not need the full slab.
-- A model of the Qwen4 architecture that leaves the same headroom holds 25 such sessions, or three
+- A model of the Qwen4 architecture that leaves the same headroom holds 24 such sessions, or three
   sessions of 1M tokens. For this class the store gives memory relief, and the switch time needs
   both rails.
 - The hardware targets (two rails, 8 TB RAID) therefore depend on the model. M0 measures the cache
   size and the cold prefill time on the reference hardware, and confirms or reduces these targets
   (section 6).
-- The connector runtime for DeepSeek-V4.1-Flash-1017 is oMLX. `mlx-lm` rejects the Engram layers
-  of the checkpoint, and `vllm-mlx` cannot serialize the cache classes of this model. oMLX already
-  has a block cache with a RAM tier and an SSD tier. KVRail takes the place of the SSD tier and
-  adds sharing between Studios (section 4.3).
-- The connector runtime for Qwen3.8-Flash-Next is open: `mlx-lm` has this model on its main branch
-  only.
+- The connector runtime for both reference models is oMLX. oMLX already has a block cache with a
+  RAM tier and an SSD tier, and both models use the same block hash, index and tiers. KVRail takes
+  the place of the SSD tier and adds sharing between Studios (section 4.3).
+- DeepSeek-V4.1-Flash-1017 has no other runtime: `mlx-lm` rejects the Engram layers of the
+  checkpoint, and `vllm-mlx` cannot serialize the cache classes of this model.
+- Qwen3.8-Flash-Next is in the stable release v0.7.3 of oMLX. `mlx-lm` has this model on its main
+  branch only, and `vllm-mlx` requires an `mlx-lm` version below 0.32, which does not have it.
 
 ## 4. Architecture
 
@@ -191,7 +191,7 @@ QP: it matches an ACK to its request and does not identify an operation.
 ### 4.2 Storage and indexing daemon (`kvraild` on Mac mini)
 
 - Block unit: a run of tokens whose length the runtime sets for each model, 256 tokens by default
-  and at most 8192. oMLX uses 2048 tokens or more for DeepSeek-V4.1.
+  and at most 8192. oMLX uses 2048 tokens or more for both reference models.
 - Block address: 256 bits inside a namespace. The namespace is
   `BLAKE3(model_uuid || quant_fmt || cache format of the runtime)`. `model_uuid` is a digest of
   the (file name, file hash) pairs, sorted by name, of the weight files and `config.json` of the
@@ -205,11 +205,15 @@ QP: it matches an ACK to its request and does not identify an operation.
   address, so recompression keeps the address.
 - Block content: the cache rows that grow with the tokens of the block (KV, compressed KV, index
   keys). Head record: the state of fixed size at one position (sliding windows, recurrent states;
-  section 3.1). oMLX writes this state into every block and adds a tail block at the end of each
-  stored request; that is acceptable for blocks of 2048 tokens or more. With 256-token blocks the
-  head record is too large to store for every block, so the store keeps it only at snapshot heads
-  and at turn boundaries. A restore resumes from the longest cached prefix that has this state,
-  and the Studio prefills the tokens after it.
+  section 3.1). For DeepSeek-V4.1, oMLX writes this state into every block and adds a tail block at
+  the end of each stored request; that is acceptable for a state of 2.6 MiB in blocks of 2048
+  tokens or more. For Qwen3.8-Flash-Next, oMLX writes the DeltaNet state of a block boundary to a
+  separate file, with the hash of that block as the key; the store keeps this file as the head
+  record of that block address. A head record that is large against its block is not stored for
+  every block: the connector sends it, and the store keeps it, only at snapshot heads and at turn
+  boundaries. This rule applies to 256-token blocks, and to Qwen3.8-Flash-Next, whose head record
+  (108 MiB) is larger than a block of 2048 tokens (55 MiB). A restore resumes from the longest
+  cached prefix that has this state, and the Studio prefills the tokens after it.
 - L1.5 Hot Pool (48 GiB unified memory): pinned ring of page-aligned buffers registered once with
   `ibv_reg_mr` at startup. Serves hot prefixes and active snapshot heads in < 1 ms. The RAM tier
   of the runtime on the Studio stays the first tier; L1.5 serves blocks that the Studio evicted
@@ -232,7 +236,17 @@ QP: it matches an ACK to its request and does not identify an operation.
 - oMLX: the connector replaces the file I/O of the SSD tier of the oMLX block cache
   (`PagedSSDCacheManager`) and keeps its RAM tier, its index and its block hashes. oMLX has no
   interface for a cache backend, so the connector is a patch that follows the oMLX releases until
-  such an interface exists upstream.
+  such an interface exists upstream. Both reference models use this path. For Qwen3.8-Flash-Next
+  the connector also replaces the file I/O of the DeltaNet state files (`_gdn_sidecars`) and
+  stores them as head records (section 4.2).
+- MTP: both reference checkpoints have MTP heads, and oMLX turns MTP decoding on for a new
+  checkpoint that has them. The store holds no MTP cache. oMLX keeps this cache outside the prompt
+  cache and in memory only, and its block hash has no MTP input. KVRail therefore uses the same
+  blocks for requests with MTP and without MTP, as oMLX does. After a restore, oMLX uses the MTP
+  state that it has in memory, or starts with an empty MTP cache. An empty MTP cache can lower the
+  draft acceptance for the first tokens; it affects the decode speed and not the stored blocks.
+  M1 verifies for both models that a block written with MTP on is equal to the same block written
+  with MTP off. If the blocks differ, the MTP mode becomes part of the namespace.
 - Remote lookup: the block hashes are chained over the token IDs, so the connector computes the
   hash of every block of a prompt without the store. When the local index has no entry for a
   block, the connector sends `Lookup` before it prefills. The request has the namespace and the
@@ -258,9 +272,12 @@ QP: it matches an ACK to its request and does not identify an operation.
   select the rows that they attend to with a built-in indexer (DeepSeek-V4.1: 512 compressed
   entries per query; Qwen4 architecture: 512 blocks of 4 tokens per layer). The Studio keeps the
   index keys and the head record, and fetches from the Mac mini only the rows that the indexer
-  selects. KVRail does not replace this selection with its own scoring, so the model output does
-  not change when the fetched rows have the same encoding as the rows in memory. A block that the
-  pipeline recompressed to FP8 or Affine4 is lossy and can change the output.
+  selects. The connector pins the blocks of an out-of-core session while the session lives. A
+  pinned block goes to L2 and is not evicted (section 4.2), so the admission filter cannot remove
+  a row that the indexer selects later. KVRail does not replace this selection with its own
+  scoring, so the model output does not change when the fetched rows have the same encoding as the
+  rows in memory. A block that the pipeline recompressed to FP8 or Affine4 is lossy and can change
+  the output.
 
 ## 5. Architectural limits (initial profile for M0-M2)
 
@@ -296,9 +313,11 @@ after M1, and it does not block M4. The work items of each milestone are tracked
   timeouts of section 5. M0 is the decision gate for the hardware targets: for both reference
   models it measures the cache bytes per token, the head record size and the cold prefill time at
   64k and 120k tokens. These values confirm or reduce the targets of section 3.1.
-- **M1 - `kvraild` + oMLX Connector**: L1.5 RAM + L2 slab tiering, the oMLX connector for
-  DeepSeek-V4.1-Flash-1017, M5 Pro FP8 compression, layer-pipelined restore, zero Studio SSD
-  writes, >= 12x TTFT speedup at 64k prefix across 6 concurrent coding-agent sessions.
+- **M1 - `kvraild` + oMLX Connector**: L1.5 RAM + L2 slab tiering, the oMLX connector for both
+  reference models with head records for the DeltaNet state, M5 Pro FP8 compression,
+  layer-pipelined restore, zero Studio SSD writes, >= 12x TTFT speedup at 64k prefix across 6
+  concurrent coding-agent sessions with DeepSeek-V4.1-Flash-1017, and the comparison of blocks
+  written with MTP on and with MTP off (section 4.3).
 - **M2 - CoW Snapshots & Fault Injection**: `pin` / `fork` / `checkout` CLI + HTTP headers,
   hit-count >= 2 write filter, cable-pull chaos test proving zero failed inference requests in
   Full Prefix Restore.
