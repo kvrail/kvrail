@@ -235,12 +235,20 @@ QP: it matches an ACK to its request and does not identify an operation.
   such an interface exists upstream.
 - Remote lookup: the block hashes are chained over the token IDs, so the connector computes the
   hash of every block of a prompt without the store. When the local index has no entry for a
-  block, the connector sends `Lookup` with the namespace and the block hashes of the prompt, in
-  order, before it prefills. The store answers with the longest run of leading blocks that it
-  holds, because a restore needs the complete chain from the first block. A hit adds the blocks to
+  block, the connector sends `Lookup` before it prefills. The request has the namespace and the
+  hashes of the blocks that follow the longest prefix in the local index, in order. The store
+  answers with the longest run of leading blocks of this list that it holds, because a restore
+  needs the complete chain: the local prefix, then the run from the store. The hash of a block
+  covers all tokens before it, so a lookup that starts after the local prefix is not ambiguous. A
+  256-byte `QP0` frame holds only a few hashes: the connector sends the list in consecutive frames
+  and stops at the first frame that the store does not hold completely. A hit adds the blocks to
   the local index. This is how a Studio finds the blocks that another Studio wrote. After a
   restart of the runtime the connector does not copy the index from the store; the index fills
   again through these lookups.
+- Stale index entry: an entry of the local index is a hint. The store does not pin the blocks that
+  a lookup returns, and it can evict a block before the read. The store answers the read of such a
+  block with an explicit miss. The connector then removes the block from the local index, resumes
+  from the blocks before it (section 4.2) and prefills the rest.
 - `vllm-mlx`: the connector replaces `SSDCacheTier`. This path covers models whose cache consists
   of `KVCache`, `CacheList` and `ArraysCache` layers.
 - Full Prefix Restore (every session that fits Studio memory): pipelined layer-wise prefetch over
