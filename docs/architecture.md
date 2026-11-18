@@ -37,8 +37,9 @@ Non-goals:
   the token IDs only. The connector therefore bypasses the store, for reads and for writes, when
   the loaded model has an adapter (request field `adapters` or server flag `--adapter-path`), a
   draft model, KV quantization (`--kv-bits`), a bounded cache (`--max-kv-size`) or SpecPrefill.
-  MTP decoding is not such an option: oMLX keeps the MTP cache outside the prompt cache, so
-  requests with MTP use the store (section 4.3).
+  KVRail does not treat MTP decoding as such an option: oMLX keeps the MTP cache outside the
+  prompt cache, so requests with MTP use the store. M1 verifies that MTP does not change the
+  output after a restore (section 4.3).
 
 ## 2. Target use cases
 
@@ -115,6 +116,9 @@ Consequences:
 - A model of the Qwen4 architecture that leaves the same headroom holds 24 such sessions, or three
   sessions of 1M tokens. For this class the store gives memory relief, and the switch time needs
   both rails.
+- In the store, each block of Qwen3.8-Flash-Next has a head record of 108 MiB (section 4.2). With
+  blocks of 8192 tokens (218 MiB), a stored session takes about 1.5 times the session size of the
+  table. A restore reads one head record, so the switch time does not change.
 - The hardware targets (two rails, 8 TB RAID) therefore depend on the model. M0 measures the cache
   size and the cold prefill time on the reference hardware, and confirms or reduces these targets
   (section 6).
@@ -140,13 +144,20 @@ queue pairs: no one-sided RDMA Read/Write, max 10 UC QPs, max 4095 work requests
 4 MiB message takes 1024 of the 4095 slots of its queue. The receiver must post a receive of the
 same frame count as the send, or the receive fails. KVRail opens three QPs per physical TB5 cable:
 
-- `QP0 (Control)`: fixed-size 256-byte RPC frames (`Lookup`, `PutMeta`, `ForkSnapshot`, explicit
-  ACKs, monotonic sequence numbers).
+- `QP0 (Control)`: fixed-size 256-byte RPC frames (`Lookup`, `Get`, `PutMeta`, `Drop`,
+  `ForkSnapshot`, explicit ACKs, monotonic sequence numbers). This section names the RPCs that
+  its rules need. M0 defines the frame layouts, and M2 defines the snapshot RPCs. `Get` starts
+  the read of the rows or of the head record of a block; for rows it also names a layer range.
+  Its answer has the total length and the chunk length of the `QP1` transfer, or the status
+  `miss` when the store does not hold the data.
 - `QP1 (Bulk KV)`: 1-4 MiB striped KV block transfers directly between `ibv_reg_mr`-registered,
   16 KiB page-aligned `MTLBuffer` regions (`mlx::core::array` backing buffers) with `xxHash64`
   frame checksums. Even chunks traverse rail 0; odd chunks traverse rail 1. With one cable, all
-  chunks traverse rail 0. The sender announces the length of each chunk on `QP0`, so that the
-  receiver posts a receive of the same frame count.
+  chunks traverse rail 0. All chunks of a transfer have one length, except the last. The sender
+  announces the total length and the chunk length on `QP0`, so that the receiver posts receives
+  of the same frame counts. Each transfer has an ID that the client chooses, and each chunk
+  carries this ID and its index. The receiver drops a chunk with another ID. A retry uses a new
+  ID, and the sender ends a transfer at its last chunk or at the batch deadline.
 - `QP2 (Speculative Stream)`: optional 1-16 KiB low-latency channel for 14 KiB `hidden_state`
   vectors and draft token trees (`mlx-dspark`, EAGLE-family DSpark / DFlash drafters) when Studio
   memory exceeds 92% capacity.
@@ -164,7 +175,9 @@ the data intact, and a send waits until the peer posts a matching receive (TN320
 every transfer has a deadline: 5 ms for a `QP0` RPC, 50 ms for one `QP1` frame, and for a `QP1`
 batch the time that its size needs at 1.9 GB/s (half of the one-cable target), with a minimum of
 50 ms. On timeout or `xxHash64` mismatch, the client drops the partial transfer and retries it
-once on the other rail when two cables connect the peers.
+once on the other rail when two cables connect the peers. The retry must not use a destination
+buffer that a posted receive of the dropped transfer still references. M0 defines how the
+receiver retires these receives on the surviving rail, and verifies it.
 
 A timeout takes the rail out of service. The side that detects the timeout resets its QPs of that
 rail before it retries; in verbs semantics the reset discards its queued sends and its posted
@@ -183,46 +196,68 @@ When no rail is left:
   the full context, and KVRail never truncates context silently.
 
 A retry can repeat an RPC that the peer already applied, because the lost message can be the ACK.
-Every mutating `QP0` RPC is therefore idempotent: `PutMeta` is keyed by the block hash, and
+Every mutating `QP0` RPC is therefore idempotent: `PutMeta` is keyed by the block address
+(namespace and block hash) and the part (rows or head record), `Drop` names a block address, and
 `ForkSnapshot` carries a snapshot ID that the client chooses. A retry sends the same request on
-the other rail, and the receiver returns the existing result. A sequence number belongs to one
-QP: it matches an ACK to its request and does not identify an operation.
+the other rail, and the receiver returns the existing result. A repeated `Drop` can remove a
+block that another Studio wrote again after the first `Drop`. The address covers the content, so
+the result is one more prefill and no wrong data. A sequence number belongs to one QP: it matches
+an ACK to its request and does not identify an operation.
 
 ### 4.2 Storage and indexing daemon (`kvraild` on Mac mini)
 
-- Block unit: a run of tokens whose length the runtime sets for each model, 256 tokens by default
-  and at most 8192. oMLX uses 2048 tokens or more for both reference models.
+- Block unit: a run of tokens with one length for each model, 256 tokens by default and at most
+  8192. The block hash chain depends on the block size, so Studios with different block sizes
+  share nothing. oMLX derives the block size of Qwen3.8-Flash-Next from the host: 4096 or 8192
+  tokens on the reference Studios. The connector therefore sets one block size on every Studio of
+  a store: 8192 tokens for both reference models.
+- Tail block: a block that is shorter than the block size. oMLX writes one at the end of the
+  system prefix and one at the end of the prompt of a stored request. The tokens after the last
+  full block of a prompt are reusable only through a tail block. oMLX keeps the two newest tail
+  blocks of a chain. It deletes an older tail block that the same process wrote; the connector
+  then sends `Drop`. The store ignores a `Drop` for a block that a snapshot references.
 - Block address: 256 bits inside a namespace. The namespace is
   `BLAKE3(model_uuid || quant_fmt || cache format of the runtime)`. `model_uuid` is a digest of
   the (file name, file hash) pairs, sorted by name, of the weight files and `config.json` of the
   loaded checkpoint, so it identifies the exact weights; the connector computes it for each model
-  that it loads. `quant_fmt` is the quantization of the model weights. When the runtime has its
-  own chained block hash, KVRail uses that hash as the address and computes no second hash: oMLX
-  chains SHA-256 over the parent hash, the token IDs and the image hashes. Otherwise the connector
+  that it loads. `quant_fmt` is the quantization of the model weights. The cache format of the
+  runtime includes the block size and, for oMLX, the storage mode and the value type of the
+  DeltaNet state. When the runtime has its own chained block hash, KVRail uses that hash as the
+  address and computes no second hash: oMLX chains SHA-256 over the model name, the parent hash,
+  the token IDs and the image hashes, and the connector sets one model name on every Studio of a
+  store. Without such a hash, the connector
   computes `H_i = BLAKE3(H_{i-1} || token IDs of block i)`. Both hashes are collision resistant,
   so crafted prompt text cannot alias another block; `xxHash64` stays as the frame checksum. The
   encoding of a stored block (FP16/BF16, FP8, Affine4) is block metadata and not part of the
   address, so recompression keeps the address.
 - Block content: the cache rows that grow with the tokens of the block (KV, compressed KV, index
   keys). Head record: the state of fixed size at one position (sliding windows, recurrent states;
-  section 3.1). For DeepSeek-V4.1, oMLX writes this state into every block and adds a tail block at
-  the end of each stored request; that is acceptable for a state of 2.6 MiB in blocks of 2048
-  tokens or more. For Qwen3.8-Flash-Next, oMLX writes the DeltaNet state of a block boundary to a
-  separate file, with the hash of that block as the key; the store keeps this file as the head
-  record of that block address. A head record that is large against its block is not stored for
-  every block: the connector sends it, and the store keeps it, only at snapshot heads and at turn
-  boundaries. This rule applies to 256-token blocks, and to Qwen3.8-Flash-Next, whose head record
-  (108 MiB) is larger than a block of 2048 tokens (55 MiB). A restore resumes from the longest
-  cached prefix that has this state, and the Studio prefills the tokens after it.
+  section 3.1). For DeepSeek-V4.1, oMLX writes this state into every block, also into each tail
+  block; that is acceptable for a state of 2.6 MiB. For
+  Qwen3.8-Flash-Next, the connector requires the `ssd_sidecar` mode of oMLX with `fp32` state.
+  oMLX then writes the DeltaNet state of each block boundary to a separate file, with the hash of
+  that block as the key, and it does not keep a block without this file. The store keeps this
+  file as the head record of the block. A block and its head record are one unit. The connector
+  sends both parts of a unit together (section 4.3). `Lookup` reports the unit only when
+  the store holds both parts, and the store evicts both parts together. A part without the other
+  part is the first that the store evicts. A `Get` names the part that it reads, so a restore
+  reads the rows of every block and the head record of the last block only. A restore resumes
+  from the longest cached prefix, and the Studio prefills the tokens after it. Blocks of 256
+  tokens with a head record of this size need a rule for the blocks that keep a head record; such
+  a runtime is outside M0-M4.
 - L1.5 Hot Pool (48 GiB unified memory): pinned ring of page-aligned buffers registered once with
-  `ibv_reg_mr` at startup. Serves hot prefixes and active snapshot heads in < 1 ms. The RAM tier
-  of the runtime on the Studio stays the first tier; L1.5 serves blocks that the Studio evicted
+  `ibv_reg_mr` at startup. Starts the transfer of hot prefixes and active snapshot heads in
+  < 1 ms (time to the first chunk); section 3.1 gives the transfer time. The RAM tier of the
+  runtime on the Studio stays the first tier; L1.5 serves blocks that the Studio evicted
   and blocks that another Studio wrote.
 - L2 Raw Slab (7.0 TiB single preallocated file on RAID 0): replaces per-block `.safetensors`
   files and SQLite hot-path locks. Uses a bounded worker pool issuing `pread`/`pwrite` (`QD=16..24`)
   with `fcntl(fd, F_NOCACHE, 1)` so macOS buffer cache never evicts L1.5 pools or model weights.
 - SSD wear admission filter: blocks written once by transient one-off prompts stay in L1.5 RAM and
   evict without touching NAND; only blocks with `hit_count >= 2` or explicit `pin` flush to L2.
+  A restore adds one hit to each block whose rows it reads; `Lookup` adds none. The store does
+  not evict a block that a snapshot references, and it does not evict a block while a read of it
+  is in progress.
 - M5 Pro GPU background pipeline: quantizes cold FP16/BF16 KV blocks to FP8 / Affine4 (2-4x wire
   and disk reduction). It stores blocks that the runtime already packs as they are: oMLX packs the
   DeepSeek-V4.1 cache to FP4 and FP8. The pipeline publishes the recompressed data and its
@@ -236,17 +271,28 @@ QP: it matches an ACK to its request and does not identify an operation.
 - oMLX: the connector replaces the file I/O of the SSD tier of the oMLX block cache
   (`PagedSSDCacheManager`) and keeps its RAM tier, its index and its block hashes. oMLX has no
   interface for a cache backend, so the connector is a patch that follows the oMLX releases until
-  such an interface exists upstream. Both reference models use this path. For Qwen3.8-Flash-Next
-  the connector also replaces the file I/O of the DeltaNet state files (`_gdn_sidecars`) and
-  stores them as head records (section 4.2).
+  such an interface exists upstream. Both reference models use this path. The statements of this
+  specification about oMLX come from its source at commit `ae12f01`, after v0.8.0rc1. M1 pins the
+  oMLX version.
+- Other SSD writers of oMLX: the connector also replaces them, so the Studio SSD takes no write.
+  The boundary snapshot store (`BoundarySnapshotSSDStore`) holds the state of each block boundary
+  during a prefill. The connector keeps these states in Studio memory: 108 MiB for each block of
+  Qwen3.8-Flash-Next, 2.6 MiB for each block of DeepSeek-V4.1. A cold prefill of
+  Qwen3.8-Flash-Next thus holds 1.5 GiB of states at 120k tokens and 12.9 GiB at 1M tokens. For
+  a session that fits Studio memory, oMLX binds each state to its block hash at the end of the
+  request. The connector then sends each unit: the rows of a block and its state file
+  (`_gdn_sidecars`) as the head record (section 4.2). Above the limit of section 5, and in
+  Out-of-Core Retrieval, the connector does not wait for the end of the request. It sends each
+  complete unit when the prefill passes the boundary of its block.
 - MTP: both reference checkpoints have MTP heads, and oMLX turns MTP decoding on for a new
   checkpoint that has them. The store holds no MTP cache. oMLX keeps this cache outside the prompt
   cache and in memory only, and its block hash has no MTP input. KVRail therefore uses the same
   blocks for requests with MTP and without MTP, as oMLX does. After a restore, oMLX uses the MTP
   state that it has in memory, or starts with an empty MTP cache. An empty MTP cache can lower the
   draft acceptance for the first tokens; it affects the decode speed and not the stored blocks.
-  M1 verifies for both models that a block written with MTP on is equal to the same block written
-  with MTP off. If the blocks differ, the MTP mode becomes part of the namespace.
+  M1 compares, for both models and at temp=0, the token output after a restore of blocks written
+  with MTP on and after a restore of the same blocks written with MTP off. If the outputs differ,
+  the MTP mode becomes part of the namespace.
 - Remote lookup: the block hashes are chained over the token IDs, so the connector computes the
   hash of every block of a prompt without the store. When the local index has no entry for a
   block, the connector sends `Lookup` before it prefills. The request has the namespace and the
@@ -254,17 +300,26 @@ QP: it matches an ACK to its request and does not identify an operation.
   answers with the longest run of leading blocks of this list that it holds, because a restore
   needs the complete chain: the local prefix, then the run from the store. The hash of a block
   covers all tokens before it, so a lookup that starts after the local prefix is not ambiguous. A
-  256-byte `QP0` frame holds only a few hashes: the connector sends the list in consecutive frames
-  and stops at the first frame that the store does not hold completely. A hit adds the blocks to
-  the local index. This is how a Studio finds the blocks that another Studio wrote. After a
-  restart of the runtime the connector does not copy the index from the store; the index fills
-  again through these lookups.
+  256-byte `QP0` frame holds only a few hashes, so the connector sends the list in consecutive
+  frames. Each frame is one `Lookup` RPC with the namespace, its own deadline and its own retry;
+  the store keeps no state between frames. The connector stops at the first frame that the store
+  does not hold completely. The connector cannot compute the hash of a tail block, because it
+  does not know the length of that block. The answer therefore also lists the tail blocks that
+  follow the last block of the run, each with its token count. It lists the newest tail blocks
+  first, and at most as many as one frame holds. The connector computes the hash for each count
+  and uses the tail block that matches its prompt; without a match it prefills. A hit adds the
+  blocks to the local index. This is how a Studio finds the blocks that another Studio wrote.
+  After a restart of the runtime the connector does not copy the index from the store; the index
+  fills again through these lookups.
 - Stale index entry: an entry of the local index is a hint. The store does not pin the blocks that
-  a lookup returns, and it can evict a block before the read. The store answers the read of such a
-  block with an explicit miss. The connector then removes the block from the local index, resumes
-  from the blocks before it (section 4.2) and prefills the rest.
+  a lookup returns, and it can evict a block before the read starts. The store then answers the
+  `Get` with the status `miss`. The connector removes the block from the local index, resumes
+  from the blocks before it (section 4.2) and prefills the rest. In Out-of-Core Retrieval the
+  Studio cannot prefill the rest: a `miss` fails the request with the explicit error of section
+  4.1.
 - `vllm-mlx`: the connector replaces `SSDCacheTier`. This path covers models whose cache consists
-  of `KVCache`, `CacheList` and `ArraysCache` layers.
+  of `KVCache`, `CacheList` and `ArraysCache` layers. Neither reference model uses this path, and
+  it is outside M0-M4.
 - Full Prefix Restore (every session that fits Studio memory): pipelined layer-wise prefetch over
   `QP1` (layer `L+1` arrives into pre-registered `MTLBuffer` slots while Studio GPU computes layer
   `L`), plus the head record of the resume position.
@@ -272,12 +327,43 @@ QP: it matches an ACK to its request and does not identify an operation.
   select the rows that they attend to with a built-in indexer (DeepSeek-V4.1: 512 compressed
   entries per query; Qwen4 architecture: 512 blocks of 4 tokens per layer). The Studio keeps the
   index keys and the head record, and fetches from the Mac mini only the rows that the indexer
-  selects. The connector pins the blocks of an out-of-core session while the session lives. A
-  pinned block goes to L2 and is not evicted (section 4.2), so the admission filter cannot remove
-  a row that the indexer selects later. KVRail does not replace this selection with its own
-  scoring, so the model output does not change when the fetched rows have the same encoding as the
-  rows in memory. A block that the pipeline recompressed to FP8 or Affine4 is lossy and can change
-  the output.
+  selects. The connector holds a snapshot of the head of each out-of-core session and replaces it
+  when the session grows. It creates the new snapshot before it drops the old one, and before it
+  removes rows from Studio memory. The store drops the session snapshots of a Studio when the
+  runtime of that Studio connects again after a restart. A session snapshot counts against the
+  limit of pinned snapshots (section 5). The store writes each block that a snapshot references
+  to L2 and does not evict it (section 4.2), so the admission filter cannot remove a row that the
+  indexer selects later. If the store rejects the snapshot, the request fails with the explicit
+  error. KVRail does not replace the selection of the indexer with its own scoring, so the model
+  output does not change when the fetched rows have the same encoding as the rows in memory. A
+  block that the pipeline recompressed to FP8 or Affine4 is lossy and can change the output.
+
+### 4.4 Open points for the M0 and M1 design
+
+These points do not change the rules above. The design document of the named milestone settles
+each of them.
+
+- Retry on the surviving rail (M0): how each side retires the queued sends and the posted
+  receives of a dropped transfer.
+- `Lookup` for tail blocks (M0): the request names the parent block and permits an empty hash
+  list. A prompt without a full block needs this, and also a prompt whose full blocks are all in
+  the local index.
+- `PutMeta` for a tail block (M0): the parent hash, a tail flag and the token count.
+- Restart detection (M0): the setup exchange needs an ID of the runtime instance, because a
+  cable pull also makes a new connection.
+- L1.5 capacity (M0): ten sessions of Qwen3.8-Flash-Next at 120k tokens take 47 to 49 GiB of the
+  48 GiB pool before a second read moves their blocks to L2.
+- Boundary state of DeepSeek-V4.1 (M0): the snapshot can also hold the rows of one block, so M0
+  measures its size.
+- Order of the tail list (M1): oMLX keeps up to 32 tail blocks under one parent, and one frame
+  holds about 6. The order must keep the tail block of a shared system prefix in the answer.
+- Part of a unit (M1): the store must not evict one part while the write of the other part is in
+  progress.
+- `Drop` during a read (M1): the behavior when a Studio drops a block that another Studio reads.
+- Scope of the oMLX patch (M1): oMLX commits a state file only from a staged file, so the patch
+  changes more than file I/O.
+- Test plans (M1, M4): the MTP mode of both runs, the prompt set and the output length of the
+  acceptance items that compare token output.
 
 ## 5. Architectural limits (initial profile for M0-M2)
 
@@ -293,18 +379,22 @@ module lands, extending [docs/style-profile.md](style-profile.md):
 | Control RPC timeout (`QP0`) | 5 ms *                        | Abort fetch, count, retry or fallback (4.1)    |
 | Bulk frame timeout (`QP1`)  | 50 ms *                       | Drop batch, retry or fallback (4.1)            |
 | Bulk batch timeout (`QP1`)  | max(50 ms, size / 1.9 GB/s) * | Drop batch, retry or fallback (4.1)            |
-| Token block size            | 256 to 8192 tokens            | Set per model by the runtime; reject others    |
+| Token block size            | 256 to 8192 tokens            | One per model in a store; tail blocks shorter  |
+| Prefill boundary states     | 1.5 GiB of Studio memory *    | Send each unit at its block boundary (4.3)     |
 | Slab parallel I/O depth     | 24 (`pread`)                  | Queue in bounded ring                          |
 | Max pinned snapshots        | 4096                          | Reject `snapshot create` with explicit error   |
 
 Limits marked `*` are provisional. M0 replaces the timeouts with values derived from the measured
-latency distribution. The limits of Out-of-Core Retrieval are set when the M3 research ends.
+latency distribution, and confirms the limit of boundary states from the measured head record
+size. The limits of Out-of-Core Retrieval are set when the M3 research ends; they include the
+bytes that session snapshots hold.
 
 ## 6. Milestones and acceptance KPIs
 
 Milestones have no dates. Each milestone is a gate: the next milestone starts only when the
 acceptance KPIs of the current one pass. The order is M0, M1, M2, M4. M3 is research: it can start
-after M1, and it does not block M4. The work items of each milestone are tracked in the
+after M1, its acceptance needs the snapshots of M2, and it does not block M4. The work items of
+each milestone are tracked in the
 [GitHub milestones](https://github.com/kvrail/kvrail/milestones) of the same names.
 
 - **M0 - Wire & Slab Core**: `librdma` 1-rail and 2-rail zero-copy `MTLBuffer` benchmark
@@ -312,12 +402,14 @@ after M1, and it does not block M4. The work items of each milestone are tracked
   with `xxHash64` verification (`kvrail bench`). The benchmark confirms or replaces the provisional
   timeouts of section 5. M0 is the decision gate for the hardware targets: for both reference
   models it measures the cache bytes per token, the head record size and the cold prefill time at
-  64k and 120k tokens. These values confirm or reduce the targets of section 3.1.
+  64k and 120k tokens. These values confirm or reduce the targets of section 3.1. M0 also defines
+  the `QP0` and `QP1` frame layouts and settles the transport points of section 4.4.
 - **M1 - `kvraild` + oMLX Connector**: L1.5 RAM + L2 slab tiering, the oMLX connector for both
   reference models with head records for the DeltaNet state, M5 Pro FP8 compression,
   layer-pipelined restore, zero Studio SSD writes, >= 12x TTFT speedup at 64k prefix across 6
-  concurrent coding-agent sessions with DeepSeek-V4.1-Flash-1017, and the comparison of blocks
-  written with MTP on and with MTP off (section 4.3).
+  concurrent coding-agent sessions with DeepSeek-V4.1-Flash-1017, for Qwen3.8-Flash-Next the same
+  token output at temp=0 after a restore from the store at 64k tokens as after a cold prefill
+  (blocks without recompression), and the MTP comparison of section 4.3.
 - **M2 - CoW Snapshots & Fault Injection**: `pin` / `fork` / `checkout` CLI + HTTP headers,
   hit-count >= 2 write filter, cable-pull chaos test proving zero failed inference requests in
   Full Prefix Restore.
@@ -328,4 +420,7 @@ after M1, and it does not block M4. The work items of each milestone are tracked
   remaining rail, and fails with the explicit error when no rail is left.
 - **M4 - Multi-Studio Sharing, `QP2` Draft & 24h Soak**: dual-Studio cache sharing test,
   `QP2` speculative draft experiment at > 92% Studio RAM occupancy (>= 1.6x decode at temp=0),
-  and 24-hour agent-swarm soak test with zero `ibv_mr` / `MTLBuffer` leaks.
+  and 24-hour agent-swarm soak test with zero `ibv_mr` / `MTLBuffer` leaks. An M3 Ultra and an
+  M5 Ultra compute the same block with different kernels. The sharing test therefore compares the
+  token output at temp=0 of a Studio from its own blocks and from the blocks of a Studio of the
+  other type. If the outputs differ, the host type becomes part of the namespace.
