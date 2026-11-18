@@ -15,6 +15,7 @@ All notable changes to this project are documented in this file. The format foll
 
 - The TigerStyle guide now lives in [kvrail/tigerstyle](https://github.com/kvrail/tigerstyle);
   `docs/style-profile.md` links to its pinned revision r5.
+- CI does not run for a change that touches only `docs/` and Markdown files.
 
 ## [0.0.1] - 2026-11-17
 

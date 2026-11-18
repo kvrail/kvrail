@@ -1,8 +1,19 @@
 name: ci
+# A change that touches only `docs/` and Markdown files does not start this workflow. No job tests
+# the content of these files. `pip install -e .` needs README.md to exist (pyproject.toml), so this
+# workflow does not catch a rename or a removal of README.md alone; the release workflow builds
+# and tests the packages on each tag. `main` has no required checks, so a skipped run does not
+# block a merge.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
 
 permissions:
   contents: read
