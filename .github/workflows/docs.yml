@@ -1,17 +1,12 @@
 name: docs
-# `ci.yml` does not start for a change that touches only `docs/` and Markdown files. This workflow
-# starts for these changes and checks the Markdown files that a build or a release reads. It runs
-# on Linux: the check needs no macOS API, and the macOS runners are scarce.
+# This workflow checks the Markdown files that a build or a release reads. `ci.yml` does not start
+# for a change that touches only `docs/` and Markdown files, so this workflow has no path filter:
+# it starts for each push to `main` and each pull request. It runs on Linux: the check needs no
+# macOS API, and the macOS runners are scarce.
 on:
   push:
     branches: [main]
-    paths:
-      - "docs/**"
-      - "**/*.md"
   pull_request:
-    paths:
-      - "docs/**"
-      - "**/*.md"
 
 permissions:
   contents: read

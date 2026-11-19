@@ -2,7 +2,8 @@ name: ci
 # A change that touches only `docs/` and Markdown files does not start this workflow. No job tests
 # the content of these files. A build or a release needs three of them to exist: README.md
 # (pyproject.toml), rust/README.md (`cargo publish`) and CHANGELOG.md (release notes). `docs.yml`
-# checks that on Linux. `main` has no required checks, so a skipped run does not block a merge.
+# checks that on Linux. It has no path filter, so it starts for each change. `main` has no
+# required checks, so a skipped run does not block a merge.
 on:
   push:
     branches: [main]
