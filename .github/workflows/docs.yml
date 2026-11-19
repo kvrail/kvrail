@@ -1,0 +1,36 @@
+name: docs
+# `ci.yml` does not start for a change that touches only `docs/` and Markdown files. This workflow
+# starts for these changes and checks the Markdown files that a build or a release reads. It runs
+# on Linux: the check needs no macOS API, and the macOS runners are scarce.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "**/*.md"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "**/*.md"
+
+permissions:
+  contents: read
+
+jobs:
+  packaging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      # pyproject.toml names README.md as the readme, so the build fails when the file is absent.
+      - run: python -m pip wheel --no-deps --wheel-dir "$RUNNER_TEMP/wheel" .
+      # `cargo publish` reads rust/README.md, and the release notes come from CHANGELOG.md. The
+      # release workflow reads both files after it starts to publish, so their absence fails here.
+      - run: |
+          test -f rust/README.md
+          test -f CHANGELOG.md
