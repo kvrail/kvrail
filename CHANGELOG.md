@@ -7,6 +7,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- `docs/architecture.md`: architecture specification with use cases, hardware and cabling rules,
+  transport and storage design, limits and the M0-M5 milestones.
 - Each `v<version>` tag also creates a GitHub Release with the wheel, the sdist and the crate,
   taken from PyPI and crates.io, and notes from this file.
 - README badges for PyPI, crates.io, CI and the license.
