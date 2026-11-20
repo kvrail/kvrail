@@ -36,17 +36,19 @@ Non-goals:
 - Adapters and runtime options that change the cache. The namespace covers the checkpoint and the
   cache signature of the runtime, and the block hash covers the token IDs (section 4.2). Some
   options change the cache without a change of the address, and M1 tests the settings of the M0
-  baseline only (section 6). The connector therefore bypasses the store, for reads and for
-  writes, when the loaded model has an adapter, a draft model, KV quantization, a bounded cache
-  or SpecPrefill. The oMLX settings for them are `turboquant_kv_enabled`, `dflash_enabled` and
-  `specprefill_enabled`. The `mlx-lm` names are `adapters`, `--adapter-path`, `--kv-bits` and
-  `--max-kv-size`. The connector also bypasses the store for a numerics mode that is not a
-  default of oMLX: the A8 prefill and the fp16 recast. Outside the M3 research, it bypasses the
-  store for a context window of Qwen3.8-Flash-Next above its native window (section 4.2). The
-  CED prefill of DeepSeek-V4.1 is a default of oMLX, so M1 tests it. The store serves it unless
-  M1 requires it off (section 6). KVRail does not treat MTP decoding as such an option: oMLX
-  keeps the MTP cache outside the prompt cache, so requests with MTP use the store. M1 verifies
-  that MTP does not change the output after a restore (section 4.3).
+  baseline only (section 6). The connector therefore bypasses the store for five options, for
+  reads and for writes. The options are an adapter, a draft model, KV quantization, a bounded
+  cache and SpecPrefill. oMLX has settings for three of them: `turboquant_kv_enabled`,
+  `specprefill_enabled`, and `dflash_enabled` or `vlm_mtp_enabled` for a draft model. oMLX does
+  not load adapters, and it has no setting for a bounded cache. The `mlx-lm` names are
+  `adapters`, `--adapter-path`, `--kv-bits` and `--max-kv-size`. The connector also bypasses the
+  store for a numerics mode that is not a default of oMLX: the A8 prefill and the fp16 recast.
+  By default, it bypasses the store for a context window of Qwen3.8-Flash-Next above its native
+  window. A connector option turns this bypass off for the M3 research (section 4.2). The CED
+  prefill of DeepSeek-V4.1 is a default of oMLX, so M1 tests it. The store serves it unless M1
+  requires it off (section 6). KVRail does not treat MTP decoding as such an option: oMLX keeps
+  the MTP cache outside the prompt cache, so requests with MTP use the store. M1 verifies that
+  MTP does not change the output after a restore (section 4.3).
 
 ## 2. Target use cases
 
@@ -238,17 +240,18 @@ an operation.
   of the runtime is its complete compatibility signature and the storage mode of the DeltaNet
   state. The signature has the model name, the layer count, the block size, the cache class of
   each layer, the payload layout, the value type of the DeltaNet state and the numerics revision.
-  The numerics revision separates blocks that the same weights compute in another way, for
-  example with the fp16 recast, the CED prefill or the A8 prefill. oMLX turns the CED prefill on
-  by default for DeepSeek-V4.1, and this mode stores approximate decoder states. The M0 baseline
+  The numerics revision separates blocks that the same weights compute in another way. Examples
+  are the fp16 recast, the CED prefill and the A8 prefill. oMLX turns the CED prefill on by
+  default for DeepSeek-V4.1, and this mode stores approximate decoder states. The M0 baseline
   and M1 use this mode; section 6 gives the rule when its restore test fails. For
   Qwen3.8-Flash-Next the revision also has a YaRN tag when the context window is above the native
   262,144 tokens. Use case 3 and the top of the range of milestone M3 need this mode. M1 and M2
-  do not test it, so the connector bypasses the store for it outside the M3 research. oMLX sets
-  the window when it loads the model, so this bypass applies to every session of that model,
-  also to a short one. The same checkpoint files and the same tensor layout therefore do not
-  prove that two blocks are compatible. The store keeps the signature with each block, and the
-  connector keeps the check of oMLX that rejects a block with another signature at a restore.
+  do not test it, so the connector bypasses the store for it by default. A connector option
+  turns this bypass off for the M3 research. oMLX sets the window when it loads the model, so
+  the bypass applies to every session of that model, also to a short one. The same checkpoint
+  files and the same tensor layout therefore do not prove that two blocks are compatible. The
+  store keeps the signature with each block, and the connector keeps the check of oMLX that
+  rejects a block with another signature at a restore.
   When the runtime has its own chained block hash, KVRail uses that hash as the address and
   computes no second hash: oMLX chains SHA-256 over the model name, the parent hash, the token
   IDs and the image hashes, and the connector sets one model name on every Studio of a store.
@@ -268,16 +271,18 @@ an operation.
   DeepSeek-V4.1 the unit has one part. The connector sends the parts of a unit together (section
   4.3), in one write generation with an ID that the client chooses. The store commits a unit when
   all its parts of one generation pass the checksum, and `Lookup` and `Get` see committed units
-  only. The first generation that the store accepts for an address wins. The store answers a put
-  of another generation with the status `stored` after the commit, and with the status `pending`
-  before it; in both cases that client sends no data. `pending` is not a result: the client does
-  not record that the store holds the unit. A client that does not need the unit for a snapshot
-  does not wait. The store discards the parts of a generation that does not complete. The unit
-  is then absent, and the next request that computes the block sends the put again; the cost is
-  one prefill, and no data is wrong. A snapshot references committed units only, and the store
+  only. The first generation that the store accepts for an address wins. For a put of another
+  generation, the store answers with the status `stored` after the commit and `pending` before
+  it. In both cases that client sends no data. `pending` is not a result: the client does not
+  record that the store holds the unit. A client that does not need the unit for a snapshot does
+  not wait. The store discards the parts of a generation that does not complete. The unit is
+  then absent, and the next request that computes the block sends the put again. The cost is one
+  prefill, and no data is wrong. A snapshot references committed units only, and the store
   rejects a snapshot that names another unit. A connector that needs a unit for a snapshot
-  therefore repeats the put until the answer is `stored` or the store accepts its own generation;
-  the expiry of a generation bounds this wait (section 4.4). A committed unit changes only when
+  therefore repeats the put until the answer is `stored` or the store accepts its own generation.
+  The expiry of a generation bounds the wait for one generation only. The connector therefore
+  has a limit of repeats, and the snapshot fails with an explicit error at this limit (section
+  4.4). A committed unit changes only when
   the pipeline publishes a new version of it. The store evicts both parts together. A `Get` names
   the part that it reads, so a restore reads the rows of every block and the head record of the
   last block only. A restore resumes from the longest cached prefix, and the Studio prefills the
@@ -288,7 +293,10 @@ an operation.
   < 1 ms (time to the first chunk); section 3.1 gives the transfer time. The RAM tier of the
   runtime on the Studio stays the first tier; L1.5 serves blocks that the Studio evicted and
   blocks that another Studio wrote. oMLX turns its RAM tier off by default
-  (`hot_cache_max_size`), so the test plans set its size (section 6).
+  (`hot_cache_max_size`), so the test plans set its size (section 6). With the RAM tier on, oMLX
+  by default keeps a new block in RAM only. It writes the block to the SSD tier at an eviction
+  or at a clean stop. The connector therefore requires `hot_cache_write_through`: oMLX then also
+  writes each block to the SSD tier, and thus to the store, when it saves the block.
 - L2 Raw Slab (7.0 TiB single preallocated file on RAID 0): replaces per-block `.safetensors`
   files and SQLite hot-path locks. Uses a bounded worker pool issuing `pread`/`pwrite` (`QD=16..24`)
   with `fcntl(fd, F_NOCACHE, 1)` so macOS buffer cache never evicts L1.5 pools or model weights.
@@ -307,8 +315,8 @@ an operation.
   and `snapshot drop` in O(depth) metadata updates with append-only journal checkpoints.
 - Snapshot precision: a snapshot is exact. It keeps the representation that each of its blocks
   has when the store publishes it, so each checkout of a snapshot restores the same cache bytes.
-  Exact means stable: when the pipeline changed a block before the snapshot, the snapshot keeps
-  the changed representation, and `snapshot create` reports the encoding of its blocks. A block
+  Exact means stable. When the pipeline changed a block before the snapshot, the snapshot keeps
+  the changed representation. `snapshot create` reports the encoding of its blocks. A block
   outside a snapshot is a cache entry, and the pipeline can change its representation. A
   snapshot policy that permits such a change is approximate. It needs its own quality criterion
   and is outside M0-M5.
@@ -408,29 +416,33 @@ each of them.
   cable pull also makes a new connection.
 - L1.5 capacity (M0): ten sessions of Qwen3.8-Flash-Next at 120k tokens take 47 to 49 GiB of the
   48 GiB pool before a second read moves their blocks to L2.
-- Boundary state of DeepSeek-V4.1 (M0): the snapshot can also hold the rows of one block, and
-  with the CED prefill the replay input of the decoder. M0 measures its size.
+- Boundary state of DeepSeek-V4.1 (M0): the snapshot can also hold the rows of one block. With
+  the CED prefill, it can also hold the replay input of the decoder. M0 measures its size.
 - Order of the tail list (M1): oMLX keeps up to 32 tail blocks under one parent, and one frame
   holds about 6. The order, or a continuation of the list, must keep the tail block of a shared
   system prefix in the answer. A tail block outside the answer costs one prefill and gives no
   wrong data.
 - Write generation (M0, M1): the status for the accepted generation, which is a part of the
-  `QP0` frame layout of M0. M1 sets the time after which an incomplete generation expires and
-  the interval of a repeated put.
+  `QP0` frame layout of M0. M1 sets the time after which an incomplete generation expires, the
+  interval of a repeated put and the limit of repeats.
 - Numerics check of oMLX (M1): oMLX skips the check until it knows the numerics revision of the
   loaded model. The connector must compute the revision from the loaded model, and bypass the
   store when it cannot.
 - Quality criterion of the lossy recompression (M2): the metric, the prompt set and the
   threshold.
-- Pipeline and snapshot publication (M2): one order for both, so that the pipeline cannot publish
-  a new version of a block after a snapshot binds it.
+- Pipeline and snapshot publication (M2): one order for both. The pipeline must not publish a
+  new version of a block after a snapshot binds it.
 - Snapshot replacement at the count limit (M2): the rule "new before old" needs one snapshot more
   than the limit of pinned snapshots permits.
 - Tokens after the last unit of a snapshot (M2): where they stay, and how a checkout computes
   them again.
 - `pending` in Out-of-Core Retrieval (M3): the rows stay in Studio memory while the connector
-  repeats the put. The limit of boundary states must also count these rows (218 MiB for each
-  block of Qwen3.8-Flash-Next), and the prefill must stop at this limit.
+  repeats the put (218 MiB for each block of Qwen3.8-Flash-Next). M3 sets a limit for these rows
+  with the other limits of Out-of-Core Retrieval (section 5), and the prefill must stop at this
+  limit.
+- Row selection in Out-of-Core Retrieval (M3): `Get` names a block and a layer range, and no
+  rows inside the block. M3 defines the request that names the rows that the indexer selects.
+  Without it, a read moves every row of each selected block.
 - Eviction between commit and snapshot (M2): the store can evict a committed unit before a
   snapshot references it. The connector then sends the unit again. M2 must bound these repeats,
   also for a snapshot whose new units exceed the L1.5 pool.
@@ -438,8 +450,10 @@ each of them.
 - Scope of the oMLX patch (M1): oMLX commits a state file only from a staged file, so the patch
   changes more than file I/O.
 - Test plans (M0, M1, M4, M5): the Studio type, the workload and the size of the RAM tier of the
-  baseline, the MTP mode of both runs, and the prompt set and the output length of the
-  acceptance items that compare token output.
+  baseline, and the MTP mode of both runs. For the case of an evicted prefix, the plans give the
+  state of the macOS page cache: oMLX reads its SSD files through this cache, and the store
+  does not use it. For the acceptance items that compare token output, the plans give the
+  prompt set and the output length.
 
 ## 5. Architectural limits (initial profile for M0-M2)
 
@@ -486,31 +500,35 @@ start after M1. The work items of each milestone are tracked in the
   the `QP0` and `QP1` frame layouts and settles the transport points of section 4.4. M0 also
   measures the baseline without KVRail: oMLX with its own RAM and SSD cache on the reference
   Studio, for both reference models and the workload of use case 1. The baseline uses the
-  default settings of oMLX with two exceptions. The block size is the size that the connector
-  requires (section 4.2). The M0 test plan sets the size of the RAM tier, because oMLX turns
-  this tier off by default. With these settings, the CED prefill is on for DeepSeek-V4.1. The
+  default settings of oMLX with three exceptions. The block size is the size that the connector
+  requires (section 4.2). oMLX has no setting for the block size. On a host where oMLX selects
+  another size, the baseline therefore needs a code change of one line
+  (`paged_cache_block_size`). The M0 test plan sets the size of the RAM tier, because oMLX turns
+  this tier off by default. The RAM tier uses `hot_cache_write_through`, as the connector
+  requires. With these settings, the CED prefill is on for DeepSeek-V4.1. The
   baseline has the end-to-end TTFT distribution (p50, p95, p99) for four cases. A warm prefix is
   a prefix in the RAM tier of the Studio. The other cases are a prefix that the RAM tier
   evicted, a prefix after a restart of the runtime, and a cold prefill. The baseline also has
   the peak memory of the Studio, with the runtime allocations and the prefill buffers. It shows
-  whether use case 1 has memory pressure. From the baseline, and before M1 measures, M0 sets the
-  threshold for the comparison of M1: a maximum TTFT regression against the baseline.
+  whether use case 1 has memory pressure. From the baseline, M0 sets the threshold for the TTFT
+  comparison of M1 before M1 measures it: a maximum TTFT regression against the baseline.
 - **M1 - `kvraild` + oMLX Connector**: L1.5 RAM + L2 slab tiering, the oMLX connector for both
   reference models with head records for the DeltaNet state, layer-pipelined restore, and zero
-  Studio SSD writes. Correctness: for both reference models, the same token output at temp=0
-  after a restore from the store at 64k tokens as after a cold prefill, with the same host, the
-  same runtime settings (the settings of the M0 baseline) and no recompression. The test covers
-  a prefix that ends at a block boundary, a prefix that ends in a tail block, and a partial hit
-  with more prefill after it. The test can fail for DeepSeek-V4.1 with the CED prefill and pass
-  without it. The connector then serves this model with the CED prefill off only, and it
-  bypasses the store when the CED prefill is on. M0 then repeats its baseline and sets the
-  threshold again with this setting. M1 does not pass when the test fails in both modes. The
+  Studio SSD writes. Correctness: for both reference models, a restore from the store at 64k
+  tokens gives the same token output at temp=0 as a cold prefill. Both runs use the same host,
+  the settings of the M0 baseline and no recompression. The test covers a prefix that ends at a
+  block boundary, a prefix that ends in a tail block, and a partial hit with more prefill after
+  it. The test can fail for DeepSeek-V4.1 with the CED prefill and pass without it. The
+  connector then serves this model with the CED prefill off only, and it bypasses the store when
+  the CED prefill is on. M1 then repeats the baseline measurement of M0 with this setting and
+  sets the threshold again, before it measures the TTFT comparison. This repeat does not open
+  the M0 gate again. M1 does not pass when the test fails in both modes. The
   MTP comparison of section 4.3 is a second test. Performance: >= 12x TTFT speedup against a
   cold prefill at 64k prefix across 6 concurrent coding-agent sessions with
   DeepSeek-V4.1-Flash-1017. M1 also measures the end-to-end TTFT distribution of KVRail against
   the M0 baseline, with the same prompts, concurrency and memory budget. It measures a warm
   prefix, a prefix that the RAM tier of the Studio evicted, and a prefix after a restart of the
-  runtime. The store serves the last two cases. The result must pass the threshold that M0 sets.
+  runtime. The store serves the last two cases. The result must pass the threshold.
 - **M2 - CoW Snapshots & Fault Injection**: `pin` / `fork` / `checkout` CLI + HTTP headers, exact
   snapshots with the admission of pinned bytes (section 4.2), hit-count >= 2 write filter, and
   cable-pull chaos test proving zero failed inference requests in Full Prefix Restore. M2 also
@@ -526,13 +544,16 @@ start after M1. The work items of each milestone are tracked in the
   error when no rail is left.
 - **M4 - Multi-Studio Sharing & 24h Soak**: dual-Studio cache sharing test, and 24-hour
   agent-swarm soak test with zero `ibv_mr` / `MTLBuffer` leaks. The sharing test measures the
-  TTFT distribution of a Studio for a prefix that the other Studio wrote, against the cold
-  prefill of the M0 baseline: oMLX without KVRail has no prefix of another Studio. A Studio with
-  an M3 Ultra and a Studio with an M5 Ultra compute the same block with different kernels. The
+  TTFT distribution of a Studio for a prefix that the other Studio wrote. It compares this
+  distribution with the cold prefill of the M0 baseline, because oMLX without KVRail has no
+  prefix of another Studio. A Studio with an M3 Ultra and a Studio with an M5 Ultra compute the
+  same block with different kernels. The
   sharing test therefore compares the token output at temp=0 of a Studio from its own blocks and
   from the blocks of a Studio of the other type. If the outputs differ, the host type becomes
   part of the namespace.
 - **M5 (research) - `QP2` Speculative Drafting**: `QP2` speculative draft experiment at > 92%
-  Studio RAM occupancy. Acceptance: >= 1.6x decode rate at temp=0 against the same model with the
-  default MTP decoding of oMLX and without `QP2` drafting, with the same token output. M5 does
-  not block M4 or a release of the cache sharing.
+  Studio RAM occupancy. Acceptance: >= 1.6x decode rate at temp=0 with the same token output.
+  The baseline is the same model with the default MTP decoding of oMLX and without `QP2`
+  drafting. A `QP2` drafter is a draft model, so the bypass of section 1 applies to its
+  requests. M5 decides whether the equal token output permits the store for them. M5 does not
+  block M4 or a release of the cache sharing.
